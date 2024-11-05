@@ -12,7 +12,9 @@
 
 ```
 >> Когда
+```
 
+```
 Когда страх!.. перь Дадо расовенавзникоду,
 Печальна праведу,
 Кого хуже вдоворилась:
@@ -45,5 +47,61 @@
 Не призывал, 
 Достелы разалос
 ```
+
+Еще пример. Обучен на 1 файле кода на `C`, взятого из ядра Linux.
+
+```
+>> void
+```
+
+```
+void wither *workqueues_buf, PAGER_ERR(ctx);
+        bool_mutex);
+
+        atomin_active dest_mach_ent_watchdog_to_pool - breal queue */
+        struct worklist_max_active);
+                        show first.
+ *
+ * Return __queue usert_dead_work);
+
+                                trap wait and pwq->pool_mutex_lock_pool))
+                inten
+         */
+                 * @cpu);
+        }
+
+        lock(&wq_barries pool coment(" cpumask to watch, 1, sing)offqd.dist_held(&wq_watchdog(strue;
+
+        if (!needs ther is must_empty(&pwq(device)
+{
+                        nr_idle work.
+ *
+ * -> A worker) {
+                desc, pool_mutex shing worker_pool->lockdep_assed = always DISABLE)))
+                struct worker's
+ */
+        if (wq->flush done flush: list_empty(&this func: tart_held(&wq_cmdline */
+started the pending is for is cleased to a point BH work
+ * The flags &= ~WORKER_IDLE_BITS);
+
+                        pool->id)
+{
+                        scnprint name punt;
+
+/**
+ * which (sscading a work, pool->current max_active;
+
+        if (resh(current flush_color @pool->attrs, -1);
+        } while from
+         * @pwq, NUMA_NODEBUG_ON(!ctx *callock(&wq_pool->inactivatest must and nr_active activate to active work, flush is long)worker ordere.
+         * nr_
+```
+
+## Это очень плохая архитектура!
+
+Во-первых, она просто глупая.
+Во-вторых, модель занимает больше сотни мегабайт на диске.
+
+## P.s.
 
 Однако, пусть GPT просты, как идея, но это не значит, что они не станут настоящим интеллектом...
