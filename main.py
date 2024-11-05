@@ -2,7 +2,7 @@ import os
 from transformer import Transformer
 
 # Температура (больше - точней)
-t = 0.98
+t = 0.995
 
 # Создаем модель
 trans = Transformer()
