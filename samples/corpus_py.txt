@@ -1,0 +1,2972 @@
+import calendar
+import contextlib
+import datetime
+import heapq
+import itertools
+import os  # noqa
+import pathlib
+import pickle
+import re
+import time
+import warnings
+from collections import defaultdict
+from http.cookies import BaseCookie, Morsel, SimpleCookie
+from typing import (
+    DefaultDict,
+    Dict,
+    FrozenSet,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+    cast,
+)
+
+from yarl import URL
+
+from .abc import AbstractCookieJar, ClearCookiePredicate
+from .helpers import is_ip_address
+from .typedefs import LooseCookies, PathLike, StrOrURL
+
+__all__ = ("CookieJar", "DummyCookieJar")
+
+
+CookieItem = Union[str, "Morsel[str]"]
+
+# We cache these string methods here as their use is in performance critical code.
+_FORMAT_PATH = "{}/{}".format
+_FORMAT_DOMAIN_REVERSED = "{1}.{0}".format
+
+# The minimum number of scheduled cookie expirations before we start cleaning up
+# the expiration heap. This is a performance optimization to avoid cleaning up the
+# heap too often when there are only a few scheduled expirations.
+_MIN_SCHEDULED_COOKIE_EXPIRATION = 100
+
+
+class CookieJar(AbstractCookieJar):
+    """Implements cookie storage adhering to RFC 6265."""
+
+    DATE_TOKENS_RE = re.compile(
+        r"[\x09\x20-\x2F\x3B-\x40\x5B-\x60\x7B-\x7E]*"
+        r"(?P<token>[\x00-\x08\x0A-\x1F\d:a-zA-Z\x7F-\xFF]+)"
+    )
+
+    DATE_HMS_TIME_RE = re.compile(r"(\d{1,2}):(\d{1,2}):(\d{1,2})")
+
+    DATE_DAY_OF_MONTH_RE = re.compile(r"(\d{1,2})")
+
+    DATE_MONTH_RE = re.compile(
+        "(jan)|(feb)|(mar)|(apr)|(may)|(jun)|(jul)|(aug)|(sep)|(oct)|(nov)|(dec)",
+        re.I,
+    )
+
+    DATE_YEAR_RE = re.compile(r"(\d{2,4})")
+
+    # calendar.timegm() fails for timestamps after datetime.datetime.max
+    # Minus one as a loss of precision occurs when timestamp() is called.
+    MAX_TIME = (
+        int(datetime.datetime.max.replace(tzinfo=datetime.timezone.utc).timestamp()) - 1
+    )
+    try:
+        calendar.timegm(time.gmtime(MAX_TIME))
+    except (OSError, ValueError):
+        # Hit the maximum representable time on Windows
+        # https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/localtime-localtime32-localtime64
+        # Throws ValueError on PyPy 3.9, OSError elsewhere
+        MAX_TIME = calendar.timegm((3000, 12, 31, 23, 59, 59, -1, -1, -1))
+    except OverflowError:
+        # #4515: datetime.max may not be representable on 32-bit platforms
+        MAX_TIME = 2**31 - 1
+    # Avoid minuses in the future, 3x faster
+    SUB_MAX_TIME = MAX_TIME - 1
+
+    def __init__(
+        self,
+        *,
+        unsafe: bool = False,
+        quote_cookie: bool = True,
+        treat_as_secure_origin: Union[StrOrURL, Iterable[StrOrURL], None] = None,
+    ) -> None:
+        self._cookies: DefaultDict[Tuple[str, str], SimpleCookie] = defaultdict(
+            SimpleCookie
+        )
+        self._morsel_cache: DefaultDict[Tuple[str, str], Dict[str, Morsel[str]]] = (
+            defaultdict(dict)
+        )
+        self._host_only_cookies: Set[Tuple[str, str]] = set()
+        self._unsafe = unsafe
+        self._quote_cookie = quote_cookie
+        if treat_as_secure_origin is None:
+            self._treat_as_secure_origin: FrozenSet[URL] = frozenset()
+        elif isinstance(treat_as_secure_origin, URL):
+            self._treat_as_secure_origin = frozenset({treat_as_secure_origin.origin()})
+        elif isinstance(treat_as_secure_origin, str):
+            self._treat_as_secure_origin = frozenset(
+                {URL(treat_as_secure_origin).origin()}
+            )
+        else:
+            self._treat_as_secure_origin = frozenset(
+                {
+                    URL(url).origin() if isinstance(url, str) else url.origin()
+                    for url in treat_as_secure_origin
+                }
+            )
+        self._expire_heap: List[Tuple[float, Tuple[str, str, str]]] = []
+        self._expirations: Dict[Tuple[str, str, str], float] = {}
+
+    def save(self, file_path: PathLike) -> None:
+        file_path = pathlib.Path(file_path)
+        with file_path.open(mode="wb") as f:
+            pickle.dump(self._cookies, f, pickle.HIGHEST_PROTOCOL)
+
+    def load(self, file_path: PathLike) -> None:
+        file_path = pathlib.Path(file_path)
+        with file_path.open(mode="rb") as f:
+            self._cookies = pickle.load(f)
+
+    def clear(self, predicate: Optional[ClearCookiePredicate] = None) -> None:
+        if predicate is None:
+            self._expire_heap.clear()
+            self._cookies.clear()
+            self._morsel_cache.clear()
+            self._host_only_cookies.clear()
+            self._expirations.clear()
+            return
+
+        now = time.time()
+        to_del = [
+            key
+            for (domain, path), cookie in self._cookies.items()
+            for name, morsel in cookie.items()
+            if (
+                (key := (domain, path, name)) in self._expirations
+                and self._expirations[key] <= now
+            )
+            or predicate(morsel)
+        ]
+        if to_del:
+            self._delete_cookies(to_del)
+
+    def clear_domain(self, domain: str) -> None:
+        self.clear(lambda x: self._is_domain_match(domain, x["domain"]))
+
+    def __iter__(self) -> "Iterator[Morsel[str]]":
+        self._do_expiration()
+        for val in self._cookies.values():
+            yield from val.values()
+
+    def __len__(self) -> int:
+        """Return number of cookies.
+
+        This function does not iterate self to avoid unnecessary expiration
+        checks.
+        """
+        return sum(len(cookie.values()) for cookie in self._cookies.values())
+
+    def _do_expiration(self) -> None:
+        """Remove expired cookies."""
+        if not (expire_heap_len := len(self._expire_heap)):
+            return
+
+        # If the expiration heap grows larger than the number expirations
+        # times two, we clean it up to avoid keeping expired entries in
+        # the heap and consuming memory. We guard this with a minimum
+        # threshold to avoid cleaning up the heap too often when there are
+        # only a few scheduled expirations.
+        if (
+            expire_heap_len > _MIN_SCHEDULED_COOKIE_EXPIRATION
+            and expire_heap_len > len(self._expirations) * 2
+        ):
+            # Remove any expired entries from the expiration heap
+            # that do not match the expiration time in the expirations
+            # as it means the cookie has been re-added to the heap
+            # with a different expiration time.
+            self._expire_heap = [
+                entry
+                for entry in self._expire_heap
+                if self._expirations.get(entry[1]) == entry[0]
+            ]
+            heapq.heapify(self._expire_heap)
+
+        now = time.time()
+        to_del: List[Tuple[str, str, str]] = []
+        # Find any expired cookies and add them to the to-delete list
+        while self._expire_heap:
+            when, cookie_key = self._expire_heap[0]
+            if when > now:
+                break
+            heapq.heappop(self._expire_heap)
+            # Check if the cookie hasn't been re-added to the heap
+            # with a different expiration time as it will be removed
+            # later when it reaches the top of the heap and its
+            # expiration time is met.
+            if self._expirations.get(cookie_key) == when:
+                to_del.append(cookie_key)
+
+        if to_del:
+            self._delete_cookies(to_del)
+
+    def _delete_cookies(self, to_del: List[Tuple[str, str, str]]) -> None:
+        for domain, path, name in to_del:
+            self._host_only_cookies.discard((domain, name))
+            self._cookies[(domain, path)].pop(name, None)
+            self._morsel_cache[(domain, path)].pop(name, None)
+            self._expirations.pop((domain, path, name), None)
+
+    def _expire_cookie(self, when: float, domain: str, path: str, name: str) -> None:
+        cookie_key = (domain, path, name)
+        if self._expirations.get(cookie_key) == when:
+            # Avoid adding duplicates to the heap
+            return
+        heapq.heappush(self._expire_heap, (when, cookie_key))
+        self._expirations[cookie_key] = when
+
+    def update_cookies(self, cookies: LooseCookies, response_url: URL = URL()) -> None:
+        """Update cookies."""
+        hostname = response_url.raw_host
+
+        if not self._unsafe and is_ip_address(hostname):
+            # Don't accept cookies from IPs
+            return
+
+        if isinstance(cookies, Mapping):
+            cookies = cookies.items()
+
+        for name, cookie in cookies:
+            if not isinstance(cookie, Morsel):
+                tmp = SimpleCookie()
+                tmp[name] = cookie  # type: ignore[assignment]
+                cookie = tmp[name]
+
+            domain = cookie["domain"]
+
+            # ignore domains with trailing dots
+            if domain and domain[-1] == ".":
+                domain = ""
+                del cookie["domain"]
+
+            if not domain and hostname is not None:
+                # Set the cookie's domain to the response hostname
+                # and set its host-only-flag
+                self._host_only_cookies.add((hostname, name))
+                domain = cookie["domain"] = hostname
+
+            if domain and domain[0] == ".":
+                # Remove leading dot
+                domain = domain[1:]
+                cookie["domain"] = domain
+
+            if hostname and not self._is_domain_match(domain, hostname):
+                # Setting cookies for different domains is not allowed
+                continue
+
+            path = cookie["path"]
+            if not path or path[0] != "/":
+                # Set the cookie's path to the response path
+                path = response_url.path
+                if not path.startswith("/"):
+                    path = "/"
+                else:
+                    # Cut everything from the last slash to the end
+                    path = "/" + path[1 : path.rfind("/")]
+                cookie["path"] = path
+            path = path.rstrip("/")
+
+            if max_age := cookie["max-age"]:
+                try:
+                    delta_seconds = int(max_age)
+                    max_age_expiration = min(time.time() + delta_seconds, self.MAX_TIME)
+                    self._expire_cookie(max_age_expiration, domain, path, name)
+                except ValueError:
+                    cookie["max-age"] = ""
+
+            elif expires := cookie["expires"]:
+                if expire_time := self._parse_date(expires):
+                    self._expire_cookie(expire_time, domain, path, name)
+                else:
+                    cookie["expires"] = ""
+
+            key = (domain, path)
+            if self._cookies[key].get(name) != cookie:
+                # Don't blow away the cache if the same
+                # cookie gets set again
+                self._cookies[key][name] = cookie
+                self._morsel_cache[key].pop(name, None)
+
+        self._do_expiration()
+
+    def filter_cookies(self, request_url: URL) -> "BaseCookie[str]":
+        """Returns this jar's cookies filtered by their attributes."""
+        if not isinstance(request_url, URL):
+            warnings.warn(  # type: ignore[unreachable]
+                "The method accepts yarl.URL instances only, got {}".format(
+                    type(request_url)
+                ),
+                DeprecationWarning,
+            )
+            request_url = URL(request_url)
+        filtered: Union[SimpleCookie, "BaseCookie[str]"] = (
+            SimpleCookie() if self._quote_cookie else BaseCookie()
+        )
+        if not self._cookies:
+            # Skip do_expiration() if there are no cookies.
+            return filtered
+        self._do_expiration()
+        if not self._cookies:
+            # Skip rest of function if no non-expired cookies.
+            return filtered
+        hostname = request_url.raw_host or ""
+
+        is_not_secure = request_url.scheme not in ("https", "wss")
+        if is_not_secure and self._treat_as_secure_origin:
+            request_origin = URL()
+            with contextlib.suppress(ValueError):
+                request_origin = request_url.origin()
+            is_not_secure = request_origin not in self._treat_as_secure_origin
+
+        # Send shared cookie
+        for c in self._cookies[("", "")].values():
+            filtered[c.key] = c.value
+
+        if is_ip_address(hostname):
+            if not self._unsafe:
+                return filtered
+            domains: Iterable[str] = (hostname,)
+        else:
+            # Get all the subdomains that might match a cookie (e.g. "foo.bar.com", "bar.com", "com")
+            domains = itertools.accumulate(
+                reversed(hostname.split(".")), _FORMAT_DOMAIN_REVERSED
+            )
+
+        # Get all the path prefixes that might match a cookie (e.g. "", "/foo", "/foo/bar")
+        paths = itertools.accumulate(request_url.path.split("/"), _FORMAT_PATH)
+        # Create every combination of (domain, path) pairs.
+        pairs = itertools.product(domains, paths)
+
+        path_len = len(request_url.path)
+        # Point 2: https://www.rfc-editor.org/rfc/rfc6265.html#section-5.4
+        for p in pairs:
+            for name, cookie in self._cookies[p].items():
+                domain = cookie["domain"]
+
+                if (domain, name) in self._host_only_cookies and domain != hostname:
+                    continue
+
+                # Skip edge case when the cookie has a trailing slash but request doesn't.
+                if len(cookie["path"]) > path_len:
+                    continue
+
+                if is_not_secure and cookie["secure"]:
+                    continue
+
+                # We already built the Morsel so reuse it here
+                if name in self._morsel_cache[p]:
+                    filtered[name] = self._morsel_cache[p][name]
+                    continue
+
+                # It's critical we use the Morsel so the coded_value
+                # (based on cookie version) is preserved
+                mrsl_val = cast("Morsel[str]", cookie.get(cookie.key, Morsel()))
+                mrsl_val.set(cookie.key, cookie.value, cookie.coded_value)
+                self._morsel_cache[p][name] = mrsl_val
+                filtered[name] = mrsl_val
+
+        return filtered
+
+    @staticmethod
+    def _is_domain_match(domain: str, hostname: str) -> bool:
+        """Implements domain matching adhering to RFC 6265."""
+        if hostname == domain:
+            return True
+
+        if not hostname.endswith(domain):
+            return False
+
+        non_matching = hostname[: -len(domain)]
+
+        if not non_matching.endswith("."):
+            return False
+
+        return not is_ip_address(hostname)
+
+    @classmethod
+    def _parse_date(cls, date_str: str) -> Optional[int]:
+        """Implements date string parsing adhering to RFC 6265."""
+        if not date_str:
+            return None
+
+        found_time = False
+        found_day = False
+        found_month = False
+        found_year = False
+
+        hour = minute = second = 0
+        day = 0
+        month = 0
+        year = 0
+
+        for token_match in cls.DATE_TOKENS_RE.finditer(date_str):
+            token = token_match.group("token")
+
+            if not found_time:
+                time_match = cls.DATE_HMS_TIME_RE.match(token)
+                if time_match:
+                    found_time = True
+                    hour, minute, second = (int(s) for s in time_match.groups())
+                    continue
+
+            if not found_day:
+                day_match = cls.DATE_DAY_OF_MONTH_RE.match(token)
+                if day_match:
+                    found_day = True
+                    day = int(day_match.group())
+                    continue
+
+            if not found_month:
+                month_match = cls.DATE_MONTH_RE.match(token)
+                if month_match:
+                    found_month = True
+                    assert month_match.lastindex is not None
+                    month = month_match.lastindex
+                    continue
+
+            if not found_year:
+                year_match = cls.DATE_YEAR_RE.match(token)
+                if year_match:
+                    found_year = True
+                    year = int(year_match.group())
+
+        if 70 <= year <= 99:
+            year += 1900
+        elif 0 <= year <= 69:
+            year += 2000
+
+        if False in (found_day, found_month, found_year, found_time):
+            return None
+
+        if not 1 <= day <= 31:
+            return None
+
+        if year < 1601 or hour > 23 or minute > 59 or second > 59:
+            return None
+
+        return calendar.timegm((year, month, day, hour, minute, second, -1, -1, -1))
+
+
+class DummyCookieJar(AbstractCookieJar):
+    """Implements a dummy cookie storage.
+
+    It can be used with the ClientSession when no cookie processing is needed.
+
+    """
+
+    def __iter__(self) -> "Iterator[Morsel[str]]":
+        while False:
+            yield None  # type: ignore[unreachable]
+
+    def __len__(self) -> int:
+        return 0
+
+    def clear(self, predicate: Optional[ClearCookiePredicate] = None) -> None:
+        pass
+
+    def clear_domain(self, domain: str) -> None:
+        pass
+
+    def update_cookies(self, cookies: LooseCookies, response_url: URL = URL()) -> None:
+        pass
+
+    def filter_cookies(self, request_url: URL) -> "BaseCookie[str]":
+        return SimpleCookie()
+
+"""HTTP Client for asyncio."""
+
+import asyncio
+import base64
+import dataclasses
+import hashlib
+import json
+import os
+import sys
+import traceback
+import warnings
+from contextlib import suppress
+from types import TracebackType
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Collection,
+    Coroutine,
+    Final,
+    FrozenSet,
+    Generator,
+    Generic,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+    TypedDict,
+    TypeVar,
+    Union,
+    final,
+)
+
+from multidict import CIMultiDict, MultiDict, MultiDictProxy, istr
+from yarl import URL
+
+from . import hdrs, http, payload
+from .abc import AbstractCookieJar
+from .client_exceptions import (
+    ClientConnectionError,
+    ClientConnectionResetError,
+    ClientConnectorCertificateError,
+    ClientConnectorDNSError,
+    ClientConnectorError,
+    ClientConnectorSSLError,
+    ClientError,
+    ClientHttpProxyError,
+    ClientOSError,
+    ClientPayloadError,
+    ClientProxyConnectionError,
+    ClientResponseError,
+    ClientSSLError,
+    ConnectionTimeoutError,
+    ContentTypeError,
+    InvalidURL,
+    InvalidUrlClientError,
+    InvalidUrlRedirectClientError,
+    NonHttpUrlClientError,
+    NonHttpUrlRedirectClientError,
+    RedirectClientError,
+    ServerConnectionError,
+    ServerDisconnectedError,
+    ServerFingerprintMismatch,
+    ServerTimeoutError,
+    SocketTimeoutError,
+    TooManyRedirects,
+    WSMessageTypeError,
+    WSServerHandshakeError,
+)
+from .client_reqrep import (
+    SSL_ALLOWED_TYPES,
+    ClientRequest,
+    ClientResponse,
+    Fingerprint,
+    RequestInfo,
+)
+from .client_ws import (
+    DEFAULT_WS_CLIENT_TIMEOUT,
+    ClientWebSocketResponse,
+    ClientWSTimeout,
+)
+from .connector import (
+    HTTP_AND_EMPTY_SCHEMA_SET,
+    BaseConnector,
+    NamedPipeConnector,
+    TCPConnector,
+    UnixConnector,
+)
+from .cookiejar import CookieJar
+from .helpers import (
+    _SENTINEL,
+    BasicAuth,
+    TimeoutHandle,
+    get_env_proxy_for_url,
+    method_must_be_empty_body,
+    sentinel,
+    strip_auth_from_url,
+)
+from .http import WS_KEY, HttpVersion, WebSocketReader, WebSocketWriter
+from .http_websocket import WSHandshakeError, WSMessage, ws_ext_gen, ws_ext_parse
+from .streams import FlowControlDataQueue
+from .tracing import Trace, TraceConfig
+from .typedefs import JSONEncoder, LooseCookies, LooseHeaders, Query, StrOrURL
+
+__all__ = (
+    # client_exceptions
+    "ClientConnectionError",
+    "ClientConnectionResetError",
+    "ClientConnectorCertificateError",
+    "ClientConnectorDNSError",
+    "ClientConnectorError",
+    "ClientConnectorSSLError",
+    "ClientError",
+    "ClientHttpProxyError",
+    "ClientOSError",
+    "ClientPayloadError",
+    "ClientProxyConnectionError",
+    "ClientResponseError",
+    "ClientSSLError",
+    "ConnectionTimeoutError",
+    "ContentTypeError",
+    "InvalidURL",
+    "InvalidUrlClientError",
+    "RedirectClientError",
+    "NonHttpUrlClientError",
+    "InvalidUrlRedirectClientError",
+    "NonHttpUrlRedirectClientError",
+    "ServerConnectionError",
+    "ServerDisconnectedError",
+    "ServerFingerprintMismatch",
+    "ServerTimeoutError",
+    "SocketTimeoutError",
+    "TooManyRedirects",
+    "WSServerHandshakeError",
+    # client_reqrep
+    "ClientRequest",
+    "ClientResponse",
+    "Fingerprint",
+    "RequestInfo",
+    # connector
+    "BaseConnector",
+    "TCPConnector",
+    "UnixConnector",
+    "NamedPipeConnector",
+    # client_ws
+    "ClientWebSocketResponse",
+    # client
+    "ClientSession",
+    "ClientTimeout",
+    "ClientWSTimeout",
+    "request",
+    "WSMessageTypeError",
+)
+
+
+if TYPE_CHECKING:
+    from ssl import SSLContext
+else:
+    SSLContext = None
+
+if sys.version_info >= (3, 11) and TYPE_CHECKING:
+    from typing import Unpack
+
+
+class _RequestOptions(TypedDict, total=False):
+    params: Query
+    data: Any
+    json: Any
+    cookies: Union[LooseCookies, None]
+    headers: Union[LooseHeaders, None]
+    skip_auto_headers: Union[Iterable[str], None]
+    auth: Union[BasicAuth, None]
+    allow_redirects: bool
+    max_redirects: int
+    compress: Union[str, bool]
+    chunked: Union[bool, None]
+    expect100: bool
+    raise_for_status: Union[None, bool, Callable[[ClientResponse], Awaitable[None]]]
+    read_until_eof: bool
+    proxy: Union[StrOrURL, None]
+    proxy_auth: Union[BasicAuth, None]
+    timeout: "Union[ClientTimeout, _SENTINEL, None]"
+    ssl: Union[SSLContext, bool, Fingerprint]
+    server_hostname: Union[str, None]
+    proxy_headers: Union[LooseHeaders, None]
+    trace_request_ctx: Union[Mapping[str, Any], None]
+    read_bufsize: Union[int, None]
+    auto_decompress: Union[bool, None]
+    max_line_size: Union[int, None]
+    max_field_size: Union[int, None]
+
+
+@dataclasses.dataclass(frozen=True)
+class ClientTimeout:
+    total: Optional[float] = None
+    connect: Optional[float] = None
+    sock_read: Optional[float] = None
+    sock_connect: Optional[float] = None
+    ceil_threshold: float = 5
+
+    # pool_queue_timeout: Optional[float] = None
+    # dns_resolution_timeout: Optional[float] = None
+    # socket_connect_timeout: Optional[float] = None
+    # connection_acquiring_timeout: Optional[float] = None
+    # new_connection_timeout: Optional[float] = None
+    # http_header_timeout: Optional[float] = None
+    # response_body_timeout: Optional[float] = None
+
+    # to create a timeout specific for a single request, either
+    # - create a completely new one to overwrite the default
+    # - or use https://docs.python.org/3/library/dataclasses.html#dataclasses.replace
+    # to overwrite the defaults
+
+
+# 5 Minute default read timeout
+DEFAULT_TIMEOUT: Final[ClientTimeout] = ClientTimeout(total=5 * 60, sock_connect=30)
+
+# https://www.rfc-editor.org/rfc/rfc9110#section-9.2.2
+IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"})
+
+_RetType = TypeVar("_RetType", ClientResponse, ClientWebSocketResponse)
+_CharsetResolver = Callable[[ClientResponse, bytes], str]
+
+
+@final
+class ClientSession:
+    """First-class interface for making HTTP requests."""
+
+    __slots__ = (
+        "_base_url",
+        "_base_url_origin",
+        "_source_traceback",
+        "_connector",
+        "_loop",
+        "_cookie_jar",
+        "_connector_owner",
+        "_default_auth",
+        "_version",
+        "_json_serialize",
+        "_requote_redirect_url",
+        "_timeout",
+        "_raise_for_status",
+        "_auto_decompress",
+        "_trust_env",
+        "_default_headers",
+        "_skip_auto_headers",
+        "_request_class",
+        "_response_class",
+        "_ws_response_class",
+        "_trace_configs",
+        "_read_bufsize",
+        "_max_line_size",
+        "_max_field_size",
+        "_resolve_charset",
+        "_default_proxy",
+        "_default_proxy_auth",
+        "_retry_connection",
+    )
+
+    def __init__(
+        self,
+        base_url: Optional[StrOrURL] = None,
+        *,
+        connector: Optional[BaseConnector] = None,
+        cookies: Optional[LooseCookies] = None,
+        headers: Optional[LooseHeaders] = None,
+        proxy: Optional[StrOrURL] = None,
+        proxy_auth: Optional[BasicAuth] = None,
+        skip_auto_headers: Optional[Iterable[str]] = None,
+        auth: Optional[BasicAuth] = None,
+        json_serialize: JSONEncoder = json.dumps,
+        request_class: Type[ClientRequest] = ClientRequest,
+        response_class: Type[ClientResponse] = ClientResponse,
+        ws_response_class: Type[ClientWebSocketResponse] = ClientWebSocketResponse,
+        version: HttpVersion = http.HttpVersion11,
+        cookie_jar: Optional[AbstractCookieJar] = None,
+        connector_owner: bool = True,
+        raise_for_status: Union[
+            bool, Callable[[ClientResponse], Awaitable[None]]
+        ] = False,
+        timeout: Union[_SENTINEL, ClientTimeout, None] = sentinel,
+        auto_decompress: bool = True,
+        trust_env: bool = False,
+        requote_redirect_url: bool = True,
+        trace_configs: Optional[List[TraceConfig[object]]] = None,
+        read_bufsize: int = 2**16,
+        max_line_size: int = 8190,
+        max_field_size: int = 8190,
+        fallback_charset_resolver: _CharsetResolver = lambda r, b: "utf-8",
+    ) -> None:
+        # We initialise _connector to None immediately, as it's referenced in __del__()
+        # and could cause issues if an exception occurs during initialisation.
+        self._connector: Optional[BaseConnector] = None
+        if base_url is None or isinstance(base_url, URL):
+            self._base_url: Optional[URL] = base_url
+            self._base_url_origin = None if base_url is None else base_url.origin()
+        else:
+            self._base_url = URL(base_url)
+            self._base_url_origin = self._base_url.origin()
+            assert self._base_url.absolute, "Only absolute URLs are supported"
+        if self._base_url is not None and not self._base_url.path.endswith("/"):
+            raise ValueError("base_url must have a trailing '/'")
+
+        loop = asyncio.get_running_loop()
+
+        if timeout is sentinel or timeout is None:
+            timeout = DEFAULT_TIMEOUT
+        if not isinstance(timeout, ClientTimeout):
+            raise ValueError(
+                f"timeout parameter cannot be of {type(timeout)} type, "
+                "please use 'timeout=ClientTimeout(...)'",
+            )
+        self._timeout = timeout
+
+        if connector is None:
+            connector = TCPConnector()
+        # Initialize these three attrs before raising any exception,
+        # they are used in __del__
+        self._connector = connector
+        self._loop = loop
+        if loop.get_debug():
+            self._source_traceback: Optional[traceback.StackSummary] = (
+                traceback.extract_stack(sys._getframe(1))
+            )
+        else:
+            self._source_traceback = None
+
+        if connector._loop is not loop:
+            raise RuntimeError("Session and connector have to use same event loop")
+
+        if cookie_jar is None:
+            cookie_jar = CookieJar()
+        self._cookie_jar = cookie_jar
+
+        if cookies:
+            self._cookie_jar.update_cookies(cookies)
+
+        self._connector_owner = connector_owner
+        self._default_auth = auth
+        self._version = version
+        self._json_serialize = json_serialize
+        self._raise_for_status = raise_for_status
+        self._auto_decompress = auto_decompress
+        self._trust_env = trust_env
+        self._requote_redirect_url = requote_redirect_url
+        self._read_bufsize = read_bufsize
+        self._max_line_size = max_line_size
+        self._max_field_size = max_field_size
+
+        # Convert to list of tuples
+        if headers:
+            real_headers: CIMultiDict[str] = CIMultiDict(headers)
+        else:
+            real_headers = CIMultiDict()
+        self._default_headers: CIMultiDict[str] = real_headers
+        if skip_auto_headers is not None:
+            self._skip_auto_headers = frozenset(istr(i) for i in skip_auto_headers)
+        else:
+            self._skip_auto_headers = frozenset()
+
+        self._request_class = request_class
+        self._response_class = response_class
+        self._ws_response_class = ws_response_class
+
+        self._trace_configs = trace_configs or []
+        for trace_config in self._trace_configs:
+            trace_config.freeze()
+
+        self._resolve_charset = fallback_charset_resolver
+
+        self._default_proxy = proxy
+        self._default_proxy_auth = proxy_auth
+        self._retry_connection: bool = True
+
+    def __init_subclass__(cls: Type["ClientSession"]) -> None:
+        raise TypeError(
+            "Inheritance class {} from ClientSession "
+            "is forbidden".format(cls.__name__)
+        )
+
+    def __del__(self, _warnings: Any = warnings) -> None:
+        if not self.closed:
+            _warnings.warn(
+                f"Unclosed client session {self!r}",
+                ResourceWarning,
+                source=self,
+            )
+            context = {"client_session": self, "message": "Unclosed client session"}
+            if self._source_traceback is not None:
+                context["source_traceback"] = self._source_traceback
+            self._loop.call_exception_handler(context)
+
+    if sys.version_info >= (3, 11) and TYPE_CHECKING:
+
+        def request(
+            self,
+            method: str,
+            url: StrOrURL,
+            **kwargs: Unpack[_RequestOptions],
+        ) -> "_RequestContextManager": ...
+
+    else:
+
+        def request(
+            self, method: str, url: StrOrURL, **kwargs: Any
+        ) -> "_RequestContextManager":
+            """Perform HTTP request."""
+            return _RequestContextManager(self._request(method, url, **kwargs))
+
+    def _build_url(self, str_or_url: StrOrURL) -> URL:
+        url = URL(str_or_url)
+        if self._base_url is None:
+            return url
+        else:
+            assert not url.absolute
+            return self._base_url.join(url)
+
+    async def _request(
+        self,
+        method: str,
+        str_or_url: StrOrURL,
+        *,
+        params: Query = None,
+        data: Any = None,
+        json: Any = None,
+        cookies: Optional[LooseCookies] = None,
+        headers: Optional[LooseHeaders] = None,
+        skip_auto_headers: Optional[Iterable[str]] = None,
+        auth: Optional[BasicAuth] = None,
+        allow_redirects: bool = True,
+        max_redirects: int = 10,
+        compress: Union[str, bool] = False,
+        chunked: Optional[bool] = None,
+        expect100: bool = False,
+        raise_for_status: Union[
+            None, bool, Callable[[ClientResponse], Awaitable[None]]
+        ] = None,
+        read_until_eof: bool = True,
+        proxy: Optional[StrOrURL] = None,
+        proxy_auth: Optional[BasicAuth] = None,
+        timeout: Union[ClientTimeout, _SENTINEL, None] = sentinel,
+        ssl: Union[SSLContext, bool, Fingerprint] = True,
+        server_hostname: Optional[str] = None,
+        proxy_headers: Optional[LooseHeaders] = None,
+        trace_request_ctx: Optional[Mapping[str, Any]] = None,
+        read_bufsize: Optional[int] = None,
+        auto_decompress: Optional[bool] = None,
+        max_line_size: Optional[int] = None,
+        max_field_size: Optional[int] = None,
+    ) -> ClientResponse:
+        # NOTE: timeout clamps existing connect and read timeouts.  We cannot
+        # set the default to None because we need to detect if the user wants
+        # to use the existing timeouts by setting timeout to None.
+
+        if self.closed:
+            raise RuntimeError("Session is closed")
+
+        if not isinstance(ssl, SSL_ALLOWED_TYPES):
+            raise TypeError(
+                "ssl should be SSLContext, Fingerprint, or bool, "
+                "got {!r} instead.".format(ssl)
+            )
+
+        if data is not None and json is not None:
+            raise ValueError(
+                "data and json parameters can not be used at the same time"
+            )
+        elif json is not None:
+            data = payload.JsonPayload(json, dumps=self._json_serialize)
+
+        redirects = 0
+        history: List[ClientResponse] = []
+        version = self._version
+        params = params or {}
+
+        # Merge with default headers and transform to CIMultiDict
+        headers = self._prepare_headers(headers)
+
+        try:
+            url = self._build_url(str_or_url)
+        except ValueError as e:
+            raise InvalidUrlClientError(str_or_url) from e
+
+        assert self._connector is not None
+        if url.scheme not in self._connector.allowed_protocol_schema_set:
+            raise NonHttpUrlClientError(url)
+
+        skip_headers = set(self._skip_auto_headers)
+        if skip_auto_headers is not None:
+            for i in skip_auto_headers:
+                skip_headers.add(istr(i))
+
+        if proxy is None:
+            proxy = self._default_proxy
+        if proxy_auth is None:
+            proxy_auth = self._default_proxy_auth
+
+        if proxy is None:
+            proxy_headers = None
+        else:
+            proxy_headers = self._prepare_headers(proxy_headers)
+            try:
+                proxy = URL(proxy)
+            except ValueError as e:
+                raise InvalidURL(proxy) from e
+
+        if timeout is sentinel or timeout is None:
+            real_timeout: ClientTimeout = self._timeout
+        else:
+            real_timeout = timeout
+        # timeout is cumulative for all request operations
+        # (request, redirects, responses, data consuming)
+        tm = TimeoutHandle(
+            self._loop, real_timeout.total, ceil_threshold=real_timeout.ceil_threshold
+        )
+        handle = tm.start()
+
+        if read_bufsize is None:
+            read_bufsize = self._read_bufsize
+
+        if auto_decompress is None:
+            auto_decompress = self._auto_decompress
+
+        if max_line_size is None:
+            max_line_size = self._max_line_size
+
+        if max_field_size is None:
+            max_field_size = self._max_field_size
+
+        traces = [
+            Trace(
+                self,
+                trace_config,
+                trace_config.trace_config_ctx(trace_request_ctx=trace_request_ctx),
+            )
+            for trace_config in self._trace_configs
+        ]
+
+        for trace in traces:
+            await trace.send_request_start(method, url.update_query(params), headers)
+
+        timer = tm.timer()
+        try:
+            with timer:
+                # https://www.rfc-editor.org/rfc/rfc9112.html#name-retrying-requests
+                retry_persistent_connection = (
+                    self._retry_connection and method in IDEMPOTENT_METHODS
+                )
+                while True:
+                    url, auth_from_url = strip_auth_from_url(url)
+                    if not url.raw_host:
+                        # NOTE: Bail early, otherwise, causes `InvalidURL` through
+                        # NOTE: `self._request_class()` below.
+                        err_exc_cls = (
+                            InvalidUrlRedirectClientError
+                            if redirects
+                            else InvalidUrlClientError
+                        )
+                        raise err_exc_cls(url)
+                    # If `auth` was passed for an already authenticated URL,
+                    # disallow only if this is the initial URL; this is to avoid issues
+                    # with sketchy redirects that are not the caller's responsibility
+                    if not history and (auth and auth_from_url):
+                        raise ValueError(
+                            "Cannot combine AUTH argument with "
+                            "credentials encoded in URL"
+                        )
+
+                    # Override the auth with the one from the URL only if we
+                    # have no auth, or if we got an auth from a redirect URL
+                    if auth is None or (history and auth_from_url is not None):
+                        auth = auth_from_url
+
+                    if (
+                        auth is None
+                        and self._default_auth
+                        and (
+                            not self._base_url or self._base_url_origin == url.origin()
+                        )
+                    ):
+                        auth = self._default_auth
+                    # It would be confusing if we support explicit
+                    # Authorization header with auth argument
+                    if auth is not None and hdrs.AUTHORIZATION in headers:
+                        raise ValueError(
+                            "Cannot combine AUTHORIZATION header "
+                            "with AUTH argument or credentials "
+                            "encoded in URL"
+                        )
+
+                    all_cookies = self._cookie_jar.filter_cookies(url)
+
+                    if cookies is not None:
+                        tmp_cookie_jar = CookieJar()
+                        tmp_cookie_jar.update_cookies(cookies)
+                        req_cookies = tmp_cookie_jar.filter_cookies(url)
+                        if req_cookies:
+                            all_cookies.load(req_cookies)
+
+                    if proxy is not None:
+                        proxy = URL(proxy)
+                    elif self._trust_env:
+                        with suppress(LookupError):
+                            proxy, proxy_auth = get_env_proxy_for_url(url)
+
+                    req = self._request_class(
+                        method,
+                        url,
+                        params=params,
+                        headers=headers,
+                        skip_auto_headers=skip_headers if skip_headers else None,
+                        data=data,
+                        cookies=all_cookies,
+                        auth=auth,
+                        version=version,
+                        compress=compress,
+                        chunked=chunked,
+                        expect100=expect100,
+                        loop=self._loop,
+                        response_class=self._response_class,
+                        proxy=proxy,
+                        proxy_auth=proxy_auth,
+                        timer=timer,
+                        session=self,
+                        ssl=ssl,
+                        server_hostname=server_hostname,
+                        proxy_headers=proxy_headers,
+                        traces=traces,
+                        trust_env=self.trust_env,
+                    )
+
+                    # connection timeout
+                    try:
+                        conn = await self._connector.connect(
+                            req, traces=traces, timeout=real_timeout
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise ConnectionTimeoutError(
+                            f"Connection timeout to host {url}"
+                        ) from exc
+
+                    assert conn.transport is not None
+
+                    assert conn.protocol is not None
+                    conn.protocol.set_response_params(
+                        timer=timer,
+                        skip_payload=method_must_be_empty_body(method),
+                        read_until_eof=read_until_eof,
+                        auto_decompress=auto_decompress,
+                        read_timeout=real_timeout.sock_read,
+                        read_bufsize=read_bufsize,
+                        timeout_ceil_threshold=self._connector._timeout_ceil_threshold,
+                        max_line_size=max_line_size,
+                        max_field_size=max_field_size,
+                    )
+
+                    try:
+                        try:
+                            resp = await req.send(conn)
+                            try:
+                                await resp.start(conn)
+                            except BaseException:
+                                resp.close()
+                                raise
+                        except BaseException:
+                            conn.close()
+                            raise
+                    except (ClientOSError, ServerDisconnectedError):
+                        if retry_persistent_connection:
+                            retry_persistent_connection = False
+                            continue
+                        raise
+                    except ClientError:
+                        raise
+                    except OSError as exc:
+                        if exc.errno is None and isinstance(exc, asyncio.TimeoutError):  # type: ignore[unreachable]
+                            raise
+                        raise ClientOSError(*exc.args) from exc
+
+                    if cookies := resp.cookies:
+                        self._cookie_jar.update_cookies(cookies, resp.url)
+
+                    # redirects
+                    if resp.status in (301, 302, 303, 307, 308) and allow_redirects:
+                        for trace in traces:
+                            await trace.send_request_redirect(
+                                method, url.update_query(params), headers, resp
+                            )
+
+                        redirects += 1
+                        history.append(resp)
+                        if max_redirects and redirects >= max_redirects:
+                            resp.close()
+                            raise TooManyRedirects(
+                                history[0].request_info, tuple(history)
+                            )
+
+                        # For 301 and 302, mimic IE, now changed in RFC
+                        # https://github.com/kennethreitz/requests/pull/269
+                        if (resp.status == 303 and resp.method != hdrs.METH_HEAD) or (
+                            resp.status in (301, 302) and resp.method == hdrs.METH_POST
+                        ):
+                            method = hdrs.METH_GET
+                            data = None
+                            if headers.get(hdrs.CONTENT_LENGTH):
+                                headers.pop(hdrs.CONTENT_LENGTH)
+
+                        r_url = resp.headers.get(hdrs.LOCATION) or resp.headers.get(
+                            hdrs.URI
+                        )
+                        if r_url is None:
+                            # see github.com/aio-libs/aiohttp/issues/2022
+                            break
+                        else:
+                            # reading from correct redirection
+                            # response is forbidden
+                            resp.release()
+
+                        try:
+                            parsed_redirect_url = URL(
+                                r_url, encoded=not self._requote_redirect_url
+                            )
+                        except ValueError as e:
+                            raise InvalidUrlRedirectClientError(
+                                r_url,
+                                "Server attempted redirecting to a location that does not look like a URL",
+                            ) from e
+
+                        scheme = parsed_redirect_url.scheme
+                        if scheme not in HTTP_AND_EMPTY_SCHEMA_SET:
+                            resp.close()
+                            raise NonHttpUrlRedirectClientError(r_url)
+                        elif not scheme:
+                            parsed_redirect_url = url.join(parsed_redirect_url)
+
+                        is_same_host_https_redirect = (
+                            url.host == parsed_redirect_url.host
+                            and parsed_redirect_url.scheme == "https"
+                            and url.scheme == "http"
+                        )
+
+                        try:
+                            redirect_origin = parsed_redirect_url.origin()
+                        except ValueError as origin_val_err:
+                            raise InvalidUrlRedirectClientError(
+                                parsed_redirect_url,
+                                "Invalid redirect URL origin",
+                            ) from origin_val_err
+
+                        if (
+                            not is_same_host_https_redirect
+                            and url.origin() != redirect_origin
+                        ):
+                            auth = None
+                            headers.pop(hdrs.AUTHORIZATION, None)
+
+                        url = parsed_redirect_url
+                        params = {}
+                        resp.release()
+                        continue
+
+                    break
+
+            # check response status
+            if raise_for_status is None:
+                raise_for_status = self._raise_for_status
+
+            if raise_for_status is None:
+                pass
+            elif callable(raise_for_status):
+                await raise_for_status(resp)
+            elif raise_for_status:
+                resp.raise_for_status()
+
+            # register connection
+            if handle is not None:
+                if resp.connection is not None:
+                    resp.connection.add_callback(handle.cancel)
+                else:
+                    handle.cancel()
+
+            resp._history = tuple(history)
+
+            for trace in traces:
+                await trace.send_request_end(
+                    method, url.update_query(params), headers, resp
+                )
+            return resp
+
+        except BaseException as e:
+            # cleanup timer
+            tm.close()
+            if handle:
+                handle.cancel()
+                handle = None
+
+            for trace in traces:
+                await trace.send_request_exception(
+                    method, url.update_query(params), headers, e
+                )
+            raise
+
+    def ws_connect(
+        self,
+        url: StrOrURL,
+        *,
+        method: str = hdrs.METH_GET,
+        protocols: Collection[str] = (),
+        timeout: Union[ClientWSTimeout, _SENTINEL] = sentinel,
+        receive_timeout: Optional[float] = None,
+        autoclose: bool = True,
+        autoping: bool = True,
+        heartbeat: Optional[float] = None,
+        auth: Optional[BasicAuth] = None,
+        origin: Optional[str] = None,
+        params: Query = None,
+        headers: Optional[LooseHeaders] = None,
+        proxy: Optional[StrOrURL] = None,
+        proxy_auth: Optional[BasicAuth] = None,
+        ssl: Union[SSLContext, bool, Fingerprint] = True,
+        server_hostname: Optional[str] = None,
+        proxy_headers: Optional[LooseHeaders] = None,
+        compress: int = 0,
+        max_msg_size: int = 4 * 1024 * 1024,
+    ) -> "_WSRequestContextManager":
+        """Initiate websocket connection."""
+        return _WSRequestContextManager(
+            self._ws_connect(
+                url,
+                method=method,
+                protocols=protocols,
+                timeout=timeout,
+                receive_timeout=receive_timeout,
+                autoclose=autoclose,
+                autoping=autoping,
+                heartbeat=heartbeat,
+                auth=auth,
+                origin=origin,
+                params=params,
+                headers=headers,
+                proxy=proxy,
+                proxy_auth=proxy_auth,
+                ssl=ssl,
+                server_hostname=server_hostname,
+                proxy_headers=proxy_headers,
+                compress=compress,
+                max_msg_size=max_msg_size,
+            )
+        )
+
+    async def _ws_connect(
+        self,
+        url: StrOrURL,
+        *,
+        method: str = hdrs.METH_GET,
+        protocols: Collection[str] = (),
+        timeout: Union[ClientWSTimeout, _SENTINEL] = sentinel,
+        receive_timeout: Optional[float] = None,
+        autoclose: bool = True,
+        autoping: bool = True,
+        heartbeat: Optional[float] = None,
+        auth: Optional[BasicAuth] = None,
+        origin: Optional[str] = None,
+        params: Query = None,
+        headers: Optional[LooseHeaders] = None,
+        proxy: Optional[StrOrURL] = None,
+        proxy_auth: Optional[BasicAuth] = None,
+        ssl: Union[SSLContext, bool, Fingerprint] = True,
+        server_hostname: Optional[str] = None,
+        proxy_headers: Optional[LooseHeaders] = None,
+        compress: int = 0,
+        max_msg_size: int = 4 * 1024 * 1024,
+    ) -> ClientWebSocketResponse:
+        if timeout is not sentinel:
+            if isinstance(timeout, ClientWSTimeout):
+                ws_timeout = timeout
+            else:
+                warnings.warn(  # type: ignore[unreachable]
+                    "parameter 'timeout' of type 'float' "
+                    "is deprecated, please use "
+                    "'timeout=ClientWSTimeout(ws_close=...)'",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                ws_timeout = ClientWSTimeout(ws_close=timeout)
+        else:
+            ws_timeout = DEFAULT_WS_CLIENT_TIMEOUT
+        if receive_timeout is not None:
+            warnings.warn(
+                "float parameter 'receive_timeout' "
+                "is deprecated, please use parameter "
+                "'timeout=ClientWSTimeout(ws_receive=...)'",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            ws_timeout = dataclasses.replace(ws_timeout, ws_receive=receive_timeout)
+
+        if headers is None:
+            real_headers: CIMultiDict[str] = CIMultiDict()
+        else:
+            real_headers = CIMultiDict(headers)
+
+        default_headers = {
+            hdrs.UPGRADE: "websocket",
+            hdrs.CONNECTION: "Upgrade",
+            hdrs.SEC_WEBSOCKET_VERSION: "13",
+        }
+
+        for key, value in default_headers.items():
+            real_headers.setdefault(key, value)
+
+        sec_key = base64.b64encode(os.urandom(16))
+        real_headers[hdrs.SEC_WEBSOCKET_KEY] = sec_key.decode()
+
+        if protocols:
+            real_headers[hdrs.SEC_WEBSOCKET_PROTOCOL] = ",".join(protocols)
+        if origin is not None:
+            real_headers[hdrs.ORIGIN] = origin
+        if compress:
+            extstr = ws_ext_gen(compress=compress)
+            real_headers[hdrs.SEC_WEBSOCKET_EXTENSIONS] = extstr
+
+        if not isinstance(ssl, SSL_ALLOWED_TYPES):
+            raise TypeError(
+                "ssl should be SSLContext, Fingerprint, or bool, "
+                "got {!r} instead.".format(ssl)
+            )
+
+        # send request
+        resp = await self.request(
+            method,
+            url,
+            params=params,
+            headers=real_headers,
+            read_until_eof=False,
+            auth=auth,
+            proxy=proxy,
+            proxy_auth=proxy_auth,
+            ssl=ssl,
+            server_hostname=server_hostname,
+            proxy_headers=proxy_headers,
+        )
+
+        try:
+            # check handshake
+            if resp.status != 101:
+                raise WSServerHandshakeError(
+                    resp.request_info,
+                    resp.history,
+                    message="Invalid response status",
+                    status=resp.status,
+                    headers=resp.headers,
+                )
+
+            if resp.headers.get(hdrs.UPGRADE, "").lower() != "websocket":
+                raise WSServerHandshakeError(
+                    resp.request_info,
+                    resp.history,
+                    message="Invalid upgrade header",
+                    status=resp.status,
+                    headers=resp.headers,
+                )
+
+            if resp.headers.get(hdrs.CONNECTION, "").lower() != "upgrade":
+                raise WSServerHandshakeError(
+                    resp.request_info,
+                    resp.history,
+                    message="Invalid connection header",
+                    status=resp.status,
+                    headers=resp.headers,
+                )
+
+            # key calculation
+            r_key = resp.headers.get(hdrs.SEC_WEBSOCKET_ACCEPT, "")
+            match = base64.b64encode(hashlib.sha1(sec_key + WS_KEY).digest()).decode()
+            if r_key != match:
+                raise WSServerHandshakeError(
+                    resp.request_info,
+                    resp.history,
+                    message="Invalid challenge response",
+                    status=resp.status,
+                    headers=resp.headers,
+                )
+
+            # websocket protocol
+            protocol = None
+            if protocols and hdrs.SEC_WEBSOCKET_PROTOCOL in resp.headers:
+                resp_protocols = [
+                    proto.strip()
+                    for proto in resp.headers[hdrs.SEC_WEBSOCKET_PROTOCOL].split(",")
+                ]
+
+                for proto in resp_protocols:
+                    if proto in protocols:
+                        protocol = proto
+                        break
+
+            # websocket compress
+            notakeover = False
+            if compress:
+                compress_hdrs = resp.headers.get(hdrs.SEC_WEBSOCKET_EXTENSIONS)
+                if compress_hdrs:
+                    try:
+                        compress, notakeover = ws_ext_parse(compress_hdrs)
+                    except WSHandshakeError as exc:
+                        raise WSServerHandshakeError(
+                            resp.request_info,
+                            resp.history,
+                            message=exc.args[0],
+                            status=resp.status,
+                            headers=resp.headers,
+                        ) from exc
+                else:
+                    compress = 0
+                    notakeover = False
+
+            conn = resp.connection
+            assert conn is not None
+            conn_proto = conn.protocol
+            assert conn_proto is not None
+
+            # For WS connection the read_timeout must be either ws_timeout.ws_receive or greater
+            # None == no timeout, i.e. infinite timeout, so None is the max timeout possible
+            if ws_timeout.ws_receive is None:
+                # Reset regardless
+                conn_proto.read_timeout = None
+            elif conn_proto.read_timeout is not None:
+                conn_proto.read_timeout = max(
+                    ws_timeout.ws_receive, conn_proto.read_timeout
+                )
+
+            transport = conn.transport
+            assert transport is not None
+            reader: FlowControlDataQueue[WSMessage] = FlowControlDataQueue(
+                conn_proto, 2**16, loop=self._loop
+            )
+            conn_proto.set_parser(WebSocketReader(reader, max_msg_size), reader)
+            writer = WebSocketWriter(
+                conn_proto,
+                transport,
+                use_mask=True,
+                compress=compress,
+                notakeover=notakeover,
+            )
+        except BaseException:
+            resp.close()
+            raise
+        else:
+            return self._ws_response_class(
+                reader,
+                writer,
+                protocol,
+                resp,
+                ws_timeout,
+                autoclose,
+                autoping,
+                self._loop,
+                heartbeat=heartbeat,
+                compress=compress,
+                client_notakeover=notakeover,
+            )
+
+    def _prepare_headers(self, headers: Optional[LooseHeaders]) -> "CIMultiDict[str]":
+        """Add default headers and transform it to CIMultiDict"""
+        # Convert headers to MultiDict
+        result = CIMultiDict(self._default_headers)
+        if headers:
+            if not isinstance(headers, (MultiDictProxy, MultiDict)):
+                headers = CIMultiDict(headers)
+            added_names: Set[str] = set()
+            for key, value in headers.items():
+                if key in added_names:
+                    result.add(key, value)
+                else:
+                    result[key] = value
+                    added_names.add(key)
+        return result
+
+    if sys.version_info >= (3, 11) and TYPE_CHECKING:
+
+        def get(
+            self,
+            url: StrOrURL,
+            **kwargs: Unpack[_RequestOptions],
+        ) -> "_RequestContextManager": ...
+
+        def options(
+            self,
+            url: StrOrURL,
+            **kwargs: Unpack[_RequestOptions],
+        ) -> "_RequestContextManager": ...
+
+        def head(
+            self,
+            url: StrOrURL,
+            **kwargs: Unpack[_RequestOptions],
+        ) -> "_RequestContextManager": ...
+
+        def post(
+            self,
+            url: StrOrURL,
+            **kwargs: Unpack[_RequestOptions],
+        ) -> "_RequestContextManager": ...
+
+        def put(
+            self,
+            url: StrOrURL,
+            **kwargs: Unpack[_RequestOptions],
+        ) -> "_RequestContextManager": ...
+
+        def patch(
+            self,
+            url: StrOrURL,
+            **kwargs: Unpack[_RequestOptions],
+        ) -> "_RequestContextManager": ...
+
+        def delete(
+            self,
+            url: StrOrURL,
+            **kwargs: Unpack[_RequestOptions],
+        ) -> "_RequestContextManager": ...
+
+    else:
+
+        def get(
+            self, url: StrOrURL, *, allow_redirects: bool = True, **kwargs: Any
+        ) -> "_RequestContextManager":
+            """Perform HTTP GET request."""
+            return _RequestContextManager(
+                self._request(
+                    hdrs.METH_GET, url, allow_redirects=allow_redirects, **kwargs
+                )
+            )
+
+        def options(
+            self, url: StrOrURL, *, allow_redirects: bool = True, **kwargs: Any
+        ) -> "_RequestContextManager":
+            """Perform HTTP OPTIONS request."""
+            return _RequestContextManager(
+                self._request(
+                    hdrs.METH_OPTIONS, url, allow_redirects=allow_redirects, **kwargs
+                )
+            )
+
+        def head(
+            self, url: StrOrURL, *, allow_redirects: bool = False, **kwargs: Any
+        ) -> "_RequestContextManager":
+            """Perform HTTP HEAD request."""
+            return _RequestContextManager(
+                self._request(
+                    hdrs.METH_HEAD, url, allow_redirects=allow_redirects, **kwargs
+                )
+            )
+
+        def post(
+            self, url: StrOrURL, *, data: Any = None, **kwargs: Any
+        ) -> "_RequestContextManager":
+            """Perform HTTP POST request."""
+            return _RequestContextManager(
+                self._request(hdrs.METH_POST, url, data=data, **kwargs)
+            )
+
+        def put(
+            self, url: StrOrURL, *, data: Any = None, **kwargs: Any
+        ) -> "_RequestContextManager":
+            """Perform HTTP PUT request."""
+            return _RequestContextManager(
+                self._request(hdrs.METH_PUT, url, data=data, **kwargs)
+            )
+
+        def patch(
+            self, url: StrOrURL, *, data: Any = None, **kwargs: Any
+        ) -> "_RequestContextManager":
+            """Perform HTTP PATCH request."""
+            return _RequestContextManager(
+                self._request(hdrs.METH_PATCH, url, data=data, **kwargs)
+            )
+
+        def delete(self, url: StrOrURL, **kwargs: Any) -> "_RequestContextManager":
+            """Perform HTTP DELETE request."""
+            return _RequestContextManager(
+                self._request(hdrs.METH_DELETE, url, **kwargs)
+            )
+
+    async def close(self) -> None:
+        """Close underlying connector.
+
+        Release all acquired resources.
+        """
+        if not self.closed:
+            if self._connector is not None and self._connector_owner:
+                await self._connector.close()
+            self._connector = None
+
+    @property
+    def closed(self) -> bool:
+        """Is client session closed.
+
+        A readonly property.
+        """
+        return self._connector is None or self._connector.closed
+
+    @property
+    def connector(self) -> Optional[BaseConnector]:
+        """Connector instance used for the session."""
+        return self._connector
+
+    @property
+    def cookie_jar(self) -> AbstractCookieJar:
+        """The session cookies."""
+        return self._cookie_jar
+
+    @property
+    def version(self) -> Tuple[int, int]:
+        """The session HTTP protocol version."""
+        return self._version
+
+    @property
+    def requote_redirect_url(self) -> bool:
+        """Do URL requoting on redirection handling."""
+        return self._requote_redirect_url
+
+    @property
+    def timeout(self) -> ClientTimeout:
+        """Timeout for the session."""
+        return self._timeout
+
+    @property
+    def headers(self) -> "CIMultiDict[str]":
+        """The default headers of the client session."""
+        return self._default_headers
+
+    @property
+    def skip_auto_headers(self) -> FrozenSet[istr]:
+        """Headers for which autogeneration should be skipped"""
+        return self._skip_auto_headers
+
+    @property
+    def auth(self) -> Optional[BasicAuth]:
+        """An object that represents HTTP Basic Authorization"""
+        return self._default_auth
+
+    @property
+    def json_serialize(self) -> JSONEncoder:
+        """Json serializer callable"""
+        return self._json_serialize
+
+    @property
+    def connector_owner(self) -> bool:
+        """Should connector be closed on session closing"""
+        return self._connector_owner
+
+    @property
+    def raise_for_status(
+        self,
+    ) -> Union[bool, Callable[[ClientResponse], Awaitable[None]]]:
+        """Should `ClientResponse.raise_for_status()` be called for each response."""
+        return self._raise_for_status
+
+    @property
+    def auto_decompress(self) -> bool:
+        """Should the body response be automatically decompressed."""
+        return self._auto_decompress
+
+    @property
+    def trust_env(self) -> bool:
+        """
+        Should proxies information from environment or netrc be trusted.
+
+        Information is from HTTP_PROXY / HTTPS_PROXY environment variables
+        or ~/.netrc file if present.
+        """
+        return self._trust_env
+
+    @property
+    def trace_configs(self) -> List[TraceConfig[Any]]:
+        """A list of TraceConfig instances used for client tracing"""
+        return self._trace_configs
+
+    def detach(self) -> None:
+        """Detach connector from session without closing the former.
+
+        Session is switched to closed state anyway.
+        """
+        self._connector = None
+
+    async def __aenter__(self) -> "ClientSession":
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> None:
+        await self.close()
+
+
+class _BaseRequestContextManager(Coroutine[Any, Any, _RetType], Generic[_RetType]):
+    __slots__ = ("_coro", "_resp")
+
+    def __init__(self, coro: Coroutine["asyncio.Future[Any]", None, _RetType]) -> None:
+        self._coro: Coroutine["asyncio.Future[Any]", None, _RetType] = coro
+
+    def send(self, arg: None) -> "asyncio.Future[Any]":
+        return self._coro.send(arg)
+
+    def throw(self, *args: Any, **kwargs: Any) -> "asyncio.Future[Any]":
+        return self._coro.throw(*args, **kwargs)
+
+    def close(self) -> None:
+        return self._coro.close()
+
+    def __await__(self) -> Generator[Any, None, _RetType]:
+        ret = self._coro.__await__()
+        return ret
+
+    def __iter__(self) -> Generator[Any, None, _RetType]:
+        return self.__await__()
+
+    async def __aenter__(self) -> _RetType:
+        self._resp: _RetType = await self._coro
+        return await self._resp.__aenter__()
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> None:
+        await self._resp.__aexit__(exc_type, exc, tb)
+
+
+_RequestContextManager = _BaseRequestContextManager[ClientResponse]
+_WSRequestContextManager = _BaseRequestContextManager[ClientWebSocketResponse]
+
+
+class _SessionRequestContextManager:
+    __slots__ = ("_coro", "_resp", "_session")
+
+    def __init__(
+        self,
+        coro: Coroutine["asyncio.Future[Any]", None, ClientResponse],
+        session: ClientSession,
+    ) -> None:
+        self._coro = coro
+        self._resp: Optional[ClientResponse] = None
+        self._session = session
+
+    async def __aenter__(self) -> ClientResponse:
+        try:
+            self._resp = await self._coro
+        except BaseException:
+            await self._session.close()
+            raise
+        else:
+            return self._resp
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> None:
+        assert self._resp is not None
+        self._resp.close()
+        await self._session.close()
+
+
+def request(
+    method: str,
+    url: StrOrURL,
+    *,
+    params: Query = None,
+    data: Any = None,
+    json: Any = None,
+    headers: Optional[LooseHeaders] = None,
+    skip_auto_headers: Optional[Iterable[str]] = None,
+    auth: Optional[BasicAuth] = None,
+    allow_redirects: bool = True,
+    max_redirects: int = 10,
+    compress: Union[str, bool] = False,
+    chunked: Optional[bool] = None,
+    expect100: bool = False,
+    raise_for_status: Optional[bool] = None,
+    read_until_eof: bool = True,
+    proxy: Optional[StrOrURL] = None,
+    proxy_auth: Optional[BasicAuth] = None,
+    timeout: Union[ClientTimeout, _SENTINEL] = sentinel,
+    cookies: Optional[LooseCookies] = None,
+    version: HttpVersion = http.HttpVersion11,
+    connector: Optional[BaseConnector] = None,
+    read_bufsize: Optional[int] = None,
+    max_line_size: int = 8190,
+    max_field_size: int = 8190,
+) -> _SessionRequestContextManager:
+    """Constructs and sends a request.
+
+    Returns response object.
+    method - HTTP method
+    url - request url
+    params - (optional) Dictionary or bytes to be sent in the query
+      string of the new request
+    data - (optional) Dictionary, bytes, or file-like object to
+      send in the body of the request
+    json - (optional) Any json compatible python object
+    headers - (optional) Dictionary of HTTP Headers to send with
+      the request
+    cookies - (optional) Dict object to send with the request
+    auth - (optional) BasicAuth named tuple represent HTTP Basic Auth
+    auth - aiohttp.helpers.BasicAuth
+    allow_redirects - (optional) If set to False, do not follow
+      redirects
+    version - Request HTTP version.
+    compress - Set to True if request has to be compressed
+       with deflate encoding.
+    chunked - Set to chunk size for chunked transfer encoding.
+    expect100 - Expect 100-continue response from server.
+    connector - BaseConnector sub-class instance to support
+       connection pooling.
+    read_until_eof - Read response until eof if response
+       does not have Content-Length header.
+    loop - Optional event loop.
+    timeout - Optional ClientTimeout settings structure, 5min
+       total timeout by default.
+    Usage::
+      >>> import aiohttp
+      >>> async with aiohttp.request('GET', 'http://python.org/') as resp:
+      ...    print(resp)
+      ...    data = await resp.read()
+      <ClientResponse(https://www.python.org/) [200 OK]>
+    """
+    connector_owner = False
+    if connector is None:
+        connector_owner = True
+        connector = TCPConnector(force_close=True)
+
+    session = ClientSession(
+        cookies=cookies,
+        version=version,
+        timeout=timeout,
+        connector=connector,
+        connector_owner=connector_owner,
+    )
+
+    return _SessionRequestContextManager(
+        session._request(
+            method,
+            url,
+            params=params,
+            data=data,
+            json=json,
+            headers=headers,
+            skip_auto_headers=skip_auto_headers,
+            auth=auth,
+            allow_redirects=allow_redirects,
+            max_redirects=max_redirects,
+            compress=compress,
+            chunked=chunked,
+            expect100=expect100,
+            raise_for_status=raise_for_status,
+            read_until_eof=read_until_eof,
+            proxy=proxy,
+            proxy_auth=proxy_auth,
+            read_bufsize=read_bufsize,
+            max_line_size=max_line_size,
+            max_field_size=max_field_size,
+        ),
+        session,
+    )
+
+import abc
+import asyncio
+import re
+import string
+from contextlib import suppress
+from enum import IntEnum
+from typing import (
+    Any,
+    ClassVar,
+    Final,
+    Generic,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Pattern,
+    Set,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+)
+
+from multidict import CIMultiDict, CIMultiDictProxy, istr
+from yarl import URL
+
+from . import hdrs
+from .base_protocol import BaseProtocol
+from .compression_utils import HAS_BROTLI, BrotliDecompressor, ZLibDecompressor
+from .helpers import (
+    _EXC_SENTINEL,
+    DEBUG,
+    NO_EXTENSIONS,
+    BaseTimerContext,
+    method_must_be_empty_body,
+    set_exception,
+    status_code_must_be_empty_body,
+)
+from .http_exceptions import (
+    BadHttpMessage,
+    BadStatusLine,
+    ContentEncodingError,
+    ContentLengthError,
+    InvalidHeader,
+    InvalidURLError,
+    LineTooLong,
+    TransferEncodingError,
+)
+from .http_writer import HttpVersion, HttpVersion10
+from .streams import EMPTY_PAYLOAD, StreamReader
+from .typedefs import RawHeaders
+
+__all__ = (
+    "HeadersParser",
+    "HttpParser",
+    "HttpRequestParser",
+    "HttpResponseParser",
+    "RawRequestMessage",
+    "RawResponseMessage",
+)
+
+_SEP = Literal[b"\r\n", b"\n"]
+
+ASCIISET: Final[Set[str]] = set(string.printable)
+
+# See https://www.rfc-editor.org/rfc/rfc9110.html#name-overview
+# and https://www.rfc-editor.org/rfc/rfc9110.html#name-tokens
+#
+#     method = token
+#     tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+#             "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+#     token = 1*tchar
+_TCHAR_SPECIALS: Final[str] = re.escape("!#$%&'*+-.^_`|~")
+TOKENRE: Final[Pattern[str]] = re.compile(f"[0-9A-Za-z{_TCHAR_SPECIALS}]+")
+VERSRE: Final[Pattern[str]] = re.compile(r"HTTP/(\d)\.(\d)", re.ASCII)
+DIGITS: Final[Pattern[str]] = re.compile(r"\d+", re.ASCII)
+HEXDIGITS: Final[Pattern[bytes]] = re.compile(rb"[0-9a-fA-F]+")
+
+
+class RawRequestMessage(NamedTuple):
+    method: str
+    path: str
+    version: HttpVersion
+    headers: CIMultiDictProxy[str]
+    raw_headers: RawHeaders
+    should_close: bool
+    compression: Optional[str]
+    upgrade: bool
+    chunked: bool
+    url: URL
+
+
+class RawResponseMessage(NamedTuple):
+    version: HttpVersion
+    code: int
+    reason: str
+    headers: CIMultiDictProxy[str]
+    raw_headers: RawHeaders
+    should_close: bool
+    compression: Optional[str]
+    upgrade: bool
+    chunked: bool
+
+
+_MsgT = TypeVar("_MsgT", RawRequestMessage, RawResponseMessage)
+
+
+class ParseState(IntEnum):
+    PARSE_NONE = 0
+    PARSE_LENGTH = 1
+    PARSE_CHUNKED = 2
+    PARSE_UNTIL_EOF = 3
+
+
+class ChunkState(IntEnum):
+    PARSE_CHUNKED_SIZE = 0
+    PARSE_CHUNKED_CHUNK = 1
+    PARSE_CHUNKED_CHUNK_EOF = 2
+    PARSE_MAYBE_TRAILERS = 3
+    PARSE_TRAILERS = 4
+
+
+class HeadersParser:
+    def __init__(
+        self, max_line_size: int = 8190, max_field_size: int = 8190, lax: bool = False
+    ) -> None:
+        self.max_line_size = max_line_size
+        self.max_field_size = max_field_size
+        self._lax = lax
+
+    def parse_headers(
+        self, lines: List[bytes]
+    ) -> Tuple["CIMultiDictProxy[str]", RawHeaders]:
+        headers: CIMultiDict[str] = CIMultiDict()
+        # note: "raw" does not mean inclusion of OWS before/after the field value
+        raw_headers = []
+
+        lines_idx = 1
+        line = lines[1]
+        line_count = len(lines)
+
+        while line:
+            # Parse initial header name : value pair.
+            try:
+                bname, bvalue = line.split(b":", 1)
+            except ValueError:
+                raise InvalidHeader(line) from None
+
+            if len(bname) == 0:
+                raise InvalidHeader(bname)
+
+            # https://www.rfc-editor.org/rfc/rfc9112.html#section-5.1-2
+            if {bname[0], bname[-1]} & {32, 9}:  # {" ", "\t"}
+                raise InvalidHeader(line)
+
+            bvalue = bvalue.lstrip(b" \t")
+            if len(bname) > self.max_field_size:
+                raise LineTooLong(
+                    "request header name {}".format(
+                        bname.decode("utf8", "backslashreplace")
+                    ),
+                    str(self.max_field_size),
+                    str(len(bname)),
+                )
+            name = bname.decode("utf-8", "surrogateescape")
+            if not TOKENRE.fullmatch(name):
+                raise InvalidHeader(bname)
+
+            header_length = len(bvalue)
+
+            # next line
+            lines_idx += 1
+            line = lines[lines_idx]
+
+            # consume continuation lines
+            continuation = self._lax and line and line[0] in (32, 9)  # (' ', '\t')
+
+            # Deprecated: https://www.rfc-editor.org/rfc/rfc9112.html#name-obsolete-line-folding
+            if continuation:
+                bvalue_lst = [bvalue]
+                while continuation:
+                    header_length += len(line)
+                    if header_length > self.max_field_size:
+                        raise LineTooLong(
+                            "request header field {}".format(
+                                bname.decode("utf8", "backslashreplace")
+                            ),
+                            str(self.max_field_size),
+                            str(header_length),
+                        )
+                    bvalue_lst.append(line)
+
+                    # next line
+                    lines_idx += 1
+                    if lines_idx < line_count:
+                        line = lines[lines_idx]
+                        if line:
+                            continuation = line[0] in (32, 9)  # (' ', '\t')
+                    else:
+                        line = b""
+                        break
+                bvalue = b"".join(bvalue_lst)
+            else:
+                if header_length > self.max_field_size:
+                    raise LineTooLong(
+                        "request header field {}".format(
+                            bname.decode("utf8", "backslashreplace")
+                        ),
+                        str(self.max_field_size),
+                        str(header_length),
+                    )
+
+            bvalue = bvalue.strip(b" \t")
+            value = bvalue.decode("utf-8", "surrogateescape")
+
+            # https://www.rfc-editor.org/rfc/rfc9110.html#section-5.5-5
+            if "\n" in value or "\r" in value or "\x00" in value:
+                raise InvalidHeader(bvalue)
+
+            headers.add(name, value)
+            raw_headers.append((bname, bvalue))
+
+        return (CIMultiDictProxy(headers), tuple(raw_headers))
+
+
+def _is_supported_upgrade(headers: CIMultiDictProxy[str]) -> bool:
+    """Check if the upgrade header is supported."""
+    return headers.get(hdrs.UPGRADE, "").lower() in {"tcp", "websocket"}
+
+
+class HttpParser(abc.ABC, Generic[_MsgT]):
+    lax: ClassVar[bool] = False
+
+    def __init__(
+        self,
+        protocol: BaseProtocol,
+        loop: asyncio.AbstractEventLoop,
+        limit: int,
+        max_line_size: int = 8190,
+        max_field_size: int = 8190,
+        timer: Optional[BaseTimerContext] = None,
+        code: Optional[int] = None,
+        method: Optional[str] = None,
+        payload_exception: Optional[Type[BaseException]] = None,
+        response_with_body: bool = True,
+        read_until_eof: bool = False,
+        auto_decompress: bool = True,
+    ) -> None:
+        self.protocol = protocol
+        self.loop = loop
+        self.max_line_size = max_line_size
+        self.max_field_size = max_field_size
+        self.timer = timer
+        self.code = code
+        self.method = method
+        self.payload_exception = payload_exception
+        self.response_with_body = response_with_body
+        self.read_until_eof = read_until_eof
+
+        self._lines: List[bytes] = []
+        self._tail = b""
+        self._upgraded = False
+        self._payload = None
+        self._payload_parser: Optional[HttpPayloadParser] = None
+        self._auto_decompress = auto_decompress
+        self._limit = limit
+        self._headers_parser = HeadersParser(max_line_size, max_field_size, self.lax)
+
+    @abc.abstractmethod
+    def parse_message(self, lines: List[bytes]) -> _MsgT: ...
+
+    @abc.abstractmethod
+    def _is_chunked_te(self, te: str) -> bool: ...
+
+    def feed_eof(self) -> Optional[_MsgT]:
+        if self._payload_parser is not None:
+            self._payload_parser.feed_eof()
+            self._payload_parser = None
+        else:
+            # try to extract partial message
+            if self._tail:
+                self._lines.append(self._tail)
+
+            if self._lines:
+                if self._lines[-1] != "\r\n":
+                    self._lines.append(b"")
+                with suppress(Exception):
+                    return self.parse_message(self._lines)
+        return None
+
+    def feed_data(
+        self,
+        data: bytes,
+        SEP: _SEP = b"\r\n",
+        EMPTY: bytes = b"",
+        CONTENT_LENGTH: istr = hdrs.CONTENT_LENGTH,
+        METH_CONNECT: str = hdrs.METH_CONNECT,
+        SEC_WEBSOCKET_KEY1: istr = hdrs.SEC_WEBSOCKET_KEY1,
+    ) -> Tuple[List[Tuple[_MsgT, StreamReader]], bool, bytes]:
+        messages = []
+
+        if self._tail:
+            data, self._tail = self._tail + data, b""
+
+        data_len = len(data)
+        start_pos = 0
+        loop = self.loop
+
+        should_close = False
+        while start_pos < data_len:
+            # read HTTP message (request/response line + headers), \r\n\r\n
+            # and split by lines
+            if self._payload_parser is None and not self._upgraded:
+                pos = data.find(SEP, start_pos)
+                # consume \r\n
+                if pos == start_pos and not self._lines:
+                    start_pos = pos + len(SEP)
+                    continue
+
+                if pos >= start_pos:
+                    if should_close:
+                        raise BadHttpMessage("Data after `Connection: close`")
+
+                    # line found
+                    line = data[start_pos:pos]
+                    if SEP == b"\n":  # For lax response parsing
+                        line = line.rstrip(b"\r")
+                    self._lines.append(line)
+                    start_pos = pos + len(SEP)
+
+                    # \r\n\r\n found
+                    if self._lines[-1] == EMPTY:
+                        try:
+                            msg: _MsgT = self.parse_message(self._lines)
+                        finally:
+                            self._lines.clear()
+
+                        def get_content_length() -> Optional[int]:
+                            # payload length
+                            length_hdr = msg.headers.get(CONTENT_LENGTH)
+                            if length_hdr is None:
+                                return None
+
+                            # Shouldn't allow +/- or other number formats.
+                            # https://www.rfc-editor.org/rfc/rfc9110#section-8.6-2
+                            # msg.headers is already stripped of leading/trailing wsp
+                            if not DIGITS.fullmatch(length_hdr):
+                                raise InvalidHeader(CONTENT_LENGTH)
+
+                            return int(length_hdr)
+
+                        length = get_content_length()
+                        # do not support old websocket spec
+                        if SEC_WEBSOCKET_KEY1 in msg.headers:
+                            raise InvalidHeader(SEC_WEBSOCKET_KEY1)
+
+                        self._upgraded = msg.upgrade and _is_supported_upgrade(
+                            msg.headers
+                        )
+
+                        method = getattr(msg, "method", self.method)
+                        # code is only present on responses
+                        code = getattr(msg, "code", 0)
+
+                        assert self.protocol is not None
+                        # calculate payload
+                        empty_body = status_code_must_be_empty_body(code) or bool(
+                            method and method_must_be_empty_body(method)
+                        )
+                        if not empty_body and (
+                            ((length is not None and length > 0) or msg.chunked)
+                            and not self._upgraded
+                        ):
+                            payload = StreamReader(
+                                self.protocol,
+                                timer=self.timer,
+                                loop=loop,
+                                limit=self._limit,
+                            )
+                            payload_parser = HttpPayloadParser(
+                                payload,
+                                length=length,
+                                chunked=msg.chunked,
+                                method=method,
+                                compression=msg.compression,
+                                code=self.code,
+                                response_with_body=self.response_with_body,
+                                auto_decompress=self._auto_decompress,
+                                lax=self.lax,
+                            )
+                            if not payload_parser.done:
+                                self._payload_parser = payload_parser
+                        elif method == METH_CONNECT:
+                            assert isinstance(msg, RawRequestMessage)
+                            payload = StreamReader(
+                                self.protocol,
+                                timer=self.timer,
+                                loop=loop,
+                                limit=self._limit,
+                            )
+                            self._upgraded = True
+                            self._payload_parser = HttpPayloadParser(
+                                payload,
+                                method=msg.method,
+                                compression=msg.compression,
+                                auto_decompress=self._auto_decompress,
+                                lax=self.lax,
+                            )
+                        elif not empty_body and length is None and self.read_until_eof:
+                            payload = StreamReader(
+                                self.protocol,
+                                timer=self.timer,
+                                loop=loop,
+                                limit=self._limit,
+                            )
+                            payload_parser = HttpPayloadParser(
+                                payload,
+                                length=length,
+                                chunked=msg.chunked,
+                                method=method,
+                                compression=msg.compression,
+                                code=self.code,
+                                response_with_body=self.response_with_body,
+                                auto_decompress=self._auto_decompress,
+                                lax=self.lax,
+                            )
+                            if not payload_parser.done:
+                                self._payload_parser = payload_parser
+                        else:
+                            payload = EMPTY_PAYLOAD
+
+                        messages.append((msg, payload))
+                        should_close = msg.should_close
+                else:
+                    self._tail = data[start_pos:]
+                    data = EMPTY
+                    break
+
+            # no parser, just store
+            elif self._payload_parser is None and self._upgraded:
+                assert not self._lines
+                break
+
+            # feed payload
+            elif data and start_pos < data_len:
+                assert not self._lines
+                assert self._payload_parser is not None
+                try:
+                    eof, data = self._payload_parser.feed_data(data[start_pos:], SEP)
+                except BaseException as underlying_exc:
+                    reraised_exc = underlying_exc
+                    if self.payload_exception is not None:
+                        reraised_exc = self.payload_exception(str(underlying_exc))
+
+                    set_exception(
+                        self._payload_parser.payload,
+                        reraised_exc,
+                        underlying_exc,
+                    )
+
+                    eof = True
+                    data = b""
+
+                if eof:
+                    start_pos = 0
+                    data_len = len(data)
+                    self._payload_parser = None
+                    continue
+            else:
+                break
+
+        if data and start_pos < data_len:
+            data = data[start_pos:]
+        else:
+            data = EMPTY
+
+        return messages, self._upgraded, data
+
+    def parse_headers(
+        self, lines: List[bytes]
+    ) -> Tuple[
+        "CIMultiDictProxy[str]", RawHeaders, Optional[bool], Optional[str], bool, bool
+    ]:
+        """Parses RFC 5322 headers from a stream.
+
+        Line continuations are supported. Returns list of header name
+        and value pairs. Header name is in upper case.
+        """
+        headers, raw_headers = self._headers_parser.parse_headers(lines)
+        close_conn = None
+        encoding = None
+        upgrade = False
+        chunked = False
+
+        # https://www.rfc-editor.org/rfc/rfc9110.html#section-5.5-6
+        # https://www.rfc-editor.org/rfc/rfc9110.html#name-collected-abnf
+        singletons = (
+            hdrs.CONTENT_LENGTH,
+            hdrs.CONTENT_LOCATION,
+            hdrs.CONTENT_RANGE,
+            hdrs.CONTENT_TYPE,
+            hdrs.ETAG,
+            hdrs.HOST,
+            hdrs.MAX_FORWARDS,
+            hdrs.SERVER,
+            hdrs.TRANSFER_ENCODING,
+            hdrs.USER_AGENT,
+        )
+        bad_hdr = next((h for h in singletons if len(headers.getall(h, ())) > 1), None)
+        if bad_hdr is not None:
+            raise BadHttpMessage(f"Duplicate '{bad_hdr}' header found.")
+
+        # keep-alive
+        conn = headers.get(hdrs.CONNECTION)
+        if conn:
+            v = conn.lower()
+            if v == "close":
+                close_conn = True
+            elif v == "keep-alive":
+                close_conn = False
+            # https://www.rfc-editor.org/rfc/rfc9110.html#name-101-switching-protocols
+            elif v == "upgrade" and headers.get(hdrs.UPGRADE):
+                upgrade = True
+
+        # encoding
+        enc = headers.get(hdrs.CONTENT_ENCODING)
+        if enc:
+            enc = enc.lower()
+            if enc in ("gzip", "deflate", "br"):
+                encoding = enc
+
+        # chunking
+        te = headers.get(hdrs.TRANSFER_ENCODING)
+        if te is not None:
+            if self._is_chunked_te(te):
+                chunked = True
+
+            if hdrs.CONTENT_LENGTH in headers:
+                raise BadHttpMessage(
+                    "Transfer-Encoding can't be present with Content-Length",
+                )
+
+        return (headers, raw_headers, close_conn, encoding, upgrade, chunked)
+
+    def set_upgraded(self, val: bool) -> None:
+        """Set connection upgraded (to websocket) mode.
+
+        :param bool val: new state.
+        """
+        self._upgraded = val
+
+
+class HttpRequestParser(HttpParser[RawRequestMessage]):
+    """Read request status line.
+
+    Exception .http_exceptions.BadStatusLine
+    could be raised in case of any errors in status line.
+    Returns RawRequestMessage.
+    """
+
+    def parse_message(self, lines: List[bytes]) -> RawRequestMessage:
+        # request line
+        line = lines[0].decode("utf-8", "surrogateescape")
+        try:
+            method, path, version = line.split(" ", maxsplit=2)
+        except ValueError:
+            raise BadStatusLine(line) from None
+
+        if len(path) > self.max_line_size:
+            raise LineTooLong(
+                "Status line is too long", str(self.max_line_size), str(len(path))
+            )
+
+        # method
+        if not TOKENRE.fullmatch(method):
+            raise BadStatusLine(method)
+
+        # version
+        match = VERSRE.fullmatch(version)
+        if match is None:
+            raise BadStatusLine(line)
+        version_o = HttpVersion(int(match.group(1)), int(match.group(2)))
+
+        if method == "CONNECT":
+            # authority-form,
+            # https://datatracker.ietf.org/doc/html/rfc7230#section-5.3.3
+            url = URL.build(authority=path, encoded=True)
+        elif path.startswith("/"):
+            # origin-form,
+            # https://datatracker.ietf.org/doc/html/rfc7230#section-5.3.1
+            path_part, _hash_separator, url_fragment = path.partition("#")
+            path_part, _question_mark_separator, qs_part = path_part.partition("?")
+
+            # NOTE: `yarl.URL.build()` is used to mimic what the Cython-based
+            # NOTE: parser does, otherwise it results into the same
+            # NOTE: HTTP Request-Line input producing different
+            # NOTE: `yarl.URL()` objects
+            url = URL.build(
+                path=path_part,
+                query_string=qs_part,
+                fragment=url_fragment,
+                encoded=True,
+            )
+        elif path == "*" and method == "OPTIONS":
+            # asterisk-form,
+            url = URL(path, encoded=True)
+        else:
+            # absolute-form for proxy maybe,
+            # https://datatracker.ietf.org/doc/html/rfc7230#section-5.3.2
+            url = URL(path, encoded=True)
+            if url.scheme == "":
+                # not absolute-form
+                raise InvalidURLError(
+                    path.encode(errors="surrogateescape").decode("latin1")
+                )
+
+        # read headers
+        (
+            headers,
+            raw_headers,
+            close,
+            compression,
+            upgrade,
+            chunked,
+        ) = self.parse_headers(lines)
+
+        if close is None:  # then the headers weren't set in the request
+            if version_o <= HttpVersion10:  # HTTP 1.0 must asks to not close
+                close = True
+            else:  # HTTP 1.1 must ask to close.
+                close = False
+
+        return RawRequestMessage(
+            method,
+            path,
+            version_o,
+            headers,
+            raw_headers,
+            close,
+            compression,
+            upgrade,
+            chunked,
+            url,
+        )
+
+    def _is_chunked_te(self, te: str) -> bool:
+        if te.rsplit(",", maxsplit=1)[-1].strip(" \t").lower() == "chunked":
+            return True
+        # https://www.rfc-editor.org/rfc/rfc9112#section-6.3-2.4.3
+        raise BadHttpMessage("Request has invalid `Transfer-Encoding`")
+
+
+class HttpResponseParser(HttpParser[RawResponseMessage]):
+    """Read response status line and headers.
+
+    BadStatusLine could be raised in case of any errors in status line.
+    Returns RawResponseMessage.
+    """
+
+    # Lax mode should only be enabled on response parser.
+    lax = not DEBUG
+
+    def feed_data(
+        self,
+        data: bytes,
+        SEP: Optional[_SEP] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Tuple[List[Tuple[RawResponseMessage, StreamReader]], bool, bytes]:
+        if SEP is None:
+            SEP = b"\r\n" if DEBUG else b"\n"
+        return super().feed_data(data, SEP, *args, **kwargs)
+
+    def parse_message(self, lines: List[bytes]) -> RawResponseMessage:
+        line = lines[0].decode("utf-8", "surrogateescape")
+        try:
+            version, status = line.split(maxsplit=1)
+        except ValueError:
+            raise BadStatusLine(line) from None
+
+        try:
+            status, reason = status.split(maxsplit=1)
+        except ValueError:
+            status = status.strip()
+            reason = ""
+
+        if len(reason) > self.max_line_size:
+            raise LineTooLong(
+                "Status line is too long", str(self.max_line_size), str(len(reason))
+            )
+
+        # version
+        match = VERSRE.fullmatch(version)
+        if match is None:
+            raise BadStatusLine(line)
+        version_o = HttpVersion(int(match.group(1)), int(match.group(2)))
+
+        # The status code is a three-digit ASCII number, no padding
+        if len(status) != 3 or not DIGITS.fullmatch(status):
+            raise BadStatusLine(line)
+        status_i = int(status)
+
+        # read headers
+        (
+            headers,
+            raw_headers,
+            close,
+            compression,
+            upgrade,
+            chunked,
+        ) = self.parse_headers(lines)
+
+        if close is None:
+            if version_o <= HttpVersion10:
+                close = True
+            # https://www.rfc-editor.org/rfc/rfc9112.html#name-message-body-length
+            elif 100 <= status_i < 200 or status_i in {204, 304}:
+                close = False
+            elif hdrs.CONTENT_LENGTH in headers or hdrs.TRANSFER_ENCODING in headers:
+                close = False
+            else:
+                # https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3-2.8
+                close = True
+
+        return RawResponseMessage(
+            version_o,
+            status_i,
+            reason.strip(),
+            headers,
+            raw_headers,
+            close,
+            compression,
+            upgrade,
+            chunked,
+        )
+
+    def _is_chunked_te(self, te: str) -> bool:
+        # https://www.rfc-editor.org/rfc/rfc9112#section-6.3-2.4.2
+        return te.rsplit(",", maxsplit=1)[-1].strip(" \t").lower() == "chunked"
+
+
+class HttpPayloadParser:
+    def __init__(
+        self,
+        payload: StreamReader,
+        length: Optional[int] = None,
+        chunked: bool = False,
+        compression: Optional[str] = None,
+        code: Optional[int] = None,
+        method: Optional[str] = None,
+        response_with_body: bool = True,
+        auto_decompress: bool = True,
+        lax: bool = False,
+    ) -> None:
+        self._length = 0
+        self._type = ParseState.PARSE_UNTIL_EOF
+        self._chunk = ChunkState.PARSE_CHUNKED_SIZE
+        self._chunk_size = 0
+        self._chunk_tail = b""
+        self._auto_decompress = auto_decompress
+        self._lax = lax
+        self.done = False
+
+        # payload decompression wrapper
+        if response_with_body and compression and self._auto_decompress:
+            real_payload: Union[StreamReader, DeflateBuffer] = DeflateBuffer(
+                payload, compression
+            )
+        else:
+            real_payload = payload
+
+        # payload parser
+        if not response_with_body:
+            # don't parse payload if it's not expected to be received
+            self._type = ParseState.PARSE_NONE
+            real_payload.feed_eof()
+            self.done = True
+        elif chunked:
+            self._type = ParseState.PARSE_CHUNKED
+        elif length is not None:
+            self._type = ParseState.PARSE_LENGTH
+            self._length = length
+            if self._length == 0:
+                real_payload.feed_eof()
+                self.done = True
+
+        self.payload = real_payload
+
+    def feed_eof(self) -> None:
+        if self._type == ParseState.PARSE_UNTIL_EOF:
+            self.payload.feed_eof()
+        elif self._type == ParseState.PARSE_LENGTH:
+            raise ContentLengthError(
+                "Not enough data for satisfy content length header."
+            )
+        elif self._type == ParseState.PARSE_CHUNKED:
+            raise TransferEncodingError(
+                "Not enough data for satisfy transfer length header."
+            )
+
+    def feed_data(
+        self, chunk: bytes, SEP: _SEP = b"\r\n", CHUNK_EXT: bytes = b";"
+    ) -> Tuple[bool, bytes]:
+        # Read specified amount of bytes
+        if self._type == ParseState.PARSE_LENGTH:
+            required = self._length
+            self._length = max(required - len(chunk), 0)
+            self.payload.feed_data(chunk[:required])
+            if self._length == 0:
+                self.payload.feed_eof()
+                return True, chunk[required:]
+
+        # Chunked transfer encoding parser
+        elif self._type == ParseState.PARSE_CHUNKED:
+            if self._chunk_tail:
+                chunk = self._chunk_tail + chunk
+                self._chunk_tail = b""
+
+            while chunk:
+                # read next chunk size
+                if self._chunk == ChunkState.PARSE_CHUNKED_SIZE:
+                    pos = chunk.find(SEP)
+                    if pos >= 0:
+                        i = chunk.find(CHUNK_EXT, 0, pos)
+                        if i >= 0:
+                            size_b = chunk[:i]  # strip chunk-extensions
+                        else:
+                            size_b = chunk[:pos]
+
+                        if self._lax:  # Allow whitespace in lax mode.
+                            size_b = size_b.strip()
+
+                        if not re.fullmatch(HEXDIGITS, size_b):
+                            exc = TransferEncodingError(
+                                chunk[:pos].decode("ascii", "surrogateescape")
+                            )
+                            set_exception(self.payload, exc)
+                            raise exc
+                        size = int(bytes(size_b), 16)
+
+                        chunk = chunk[pos + len(SEP) :]
+                        if size == 0:  # eof marker
+                            self._chunk = ChunkState.PARSE_MAYBE_TRAILERS
+                            if self._lax and chunk.startswith(b"\r"):
+                                chunk = chunk[1:]
+                        else:
+                            self._chunk = ChunkState.PARSE_CHUNKED_CHUNK
+                            self._chunk_size = size
+                            self.payload.begin_http_chunk_receiving()
+                    else:
+                        self._chunk_tail = chunk
+                        return False, b""
+
+                # read chunk and feed buffer
+                if self._chunk == ChunkState.PARSE_CHUNKED_CHUNK:
+                    required = self._chunk_size
+                    self._chunk_size = max(required - len(chunk), 0)
+                    self.payload.feed_data(chunk[:required])
+
+                    if self._chunk_size:
+                        return False, b""
+                    chunk = chunk[required:]
+                    self._chunk = ChunkState.PARSE_CHUNKED_CHUNK_EOF
+                    self.payload.end_http_chunk_receiving()
+
+                # toss the CRLF at the end of the chunk
+                if self._chunk == ChunkState.PARSE_CHUNKED_CHUNK_EOF:
+                    if self._lax and chunk.startswith(b"\r"):
+                        chunk = chunk[1:]
+                    if chunk[: len(SEP)] == SEP:
+                        chunk = chunk[len(SEP) :]
+                        self._chunk = ChunkState.PARSE_CHUNKED_SIZE
+                    else:
+                        self._chunk_tail = chunk
+                        return False, b""
+
+                # if stream does not contain trailer, after 0\r\n
+                # we should get another \r\n otherwise
+                # trailers needs to be skipped until \r\n\r\n
+                if self._chunk == ChunkState.PARSE_MAYBE_TRAILERS:
+                    head = chunk[: len(SEP)]
+                    if head == SEP:
+                        # end of stream
+                        self.payload.feed_eof()
+                        return True, chunk[len(SEP) :]
+                    # Both CR and LF, or only LF may not be received yet. It is
+                    # expected that CRLF or LF will be shown at the very first
+                    # byte next time, otherwise trailers should come. The last
+                    # CRLF which marks the end of response might not be
+                    # contained in the same TCP segment which delivered the
+                    # size indicator.
+                    if not head:
+                        return False, b""
+                    if head == SEP[:1]:
+                        self._chunk_tail = head
+                        return False, b""
+                    self._chunk = ChunkState.PARSE_TRAILERS
+
+                # read and discard trailer up to the CRLF terminator
+                if self._chunk == ChunkState.PARSE_TRAILERS:
+                    pos = chunk.find(SEP)
+                    if pos >= 0:
+                        chunk = chunk[pos + len(SEP) :]
+                        self._chunk = ChunkState.PARSE_MAYBE_TRAILERS
+                    else:
+                        self._chunk_tail = chunk
+                        return False, b""
+
+        # Read all bytes until eof
+        elif self._type == ParseState.PARSE_UNTIL_EOF:
+            self.payload.feed_data(chunk)
+
+        return False, b""
+
+
+class DeflateBuffer:
+    """DeflateStream decompress stream and feed data into specified stream."""
+
+    def __init__(self, out: StreamReader, encoding: Optional[str]) -> None:
+        self.out = out
+        self.size = 0
+        self.encoding = encoding
+        self._started_decoding = False
+
+        self.decompressor: Union[BrotliDecompressor, ZLibDecompressor]
+        if encoding == "br":
+            if not HAS_BROTLI:  # pragma: no cover
+                raise ContentEncodingError(
+                    "Can not decode content-encoding: brotli (br). "
+                    "Please install `Brotli`"
+                )
+            self.decompressor = BrotliDecompressor()
+        else:
+            self.decompressor = ZLibDecompressor(encoding=encoding)
+
+    def set_exception(
+        self,
+        exc: Union[Type[BaseException], BaseException],
+        exc_cause: BaseException = _EXC_SENTINEL,
+    ) -> None:
+        set_exception(self.out, exc, exc_cause)
+
+    def feed_data(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+
+        self.size += len(chunk)
+
+        # RFC1950
+        # bits 0..3 = CM = 0b1000 = 8 = "deflate"
+        # bits 4..7 = CINFO = 1..7 = windows size.
+        if (
+            not self._started_decoding
+            and self.encoding == "deflate"
+            and chunk[0] & 0xF != 8
+        ):
+            # Change the decoder to decompress incorrectly compressed data
+            # Actually we should issue a warning about non-RFC-compliant data.
+            self.decompressor = ZLibDecompressor(
+                encoding=self.encoding, suppress_deflate_header=True
+            )
+
+        try:
+            chunk = self.decompressor.decompress_sync(chunk)
+        except Exception:
+            raise ContentEncodingError(
+                "Can not decode content-encoding: %s" % self.encoding
+            )
+
+        self._started_decoding = True
+
+        if chunk:
+            self.out.feed_data(chunk)
+
+    def feed_eof(self) -> None:
+        chunk = self.decompressor.flush()
+
+        if chunk or self.size > 0:
+            self.out.feed_data(chunk)
+            # decompressor is not brotli unless encoding is "br"
+            if self.encoding == "deflate" and not self.decompressor.eof:  # type: ignore[union-attr]
+                raise ContentEncodingError("deflate")
+
+        self.out.feed_eof()
+
+    def begin_http_chunk_receiving(self) -> None:
+        self.out.begin_http_chunk_receiving()
+
+    def end_http_chunk_receiving(self) -> None:
+        self.out.end_http_chunk_receiving()
+
+
+HttpRequestParserPy = HttpRequestParser
+HttpResponseParserPy = HttpResponseParser
+RawRequestMessagePy = RawRequestMessage
+RawResponseMessagePy = RawResponseMessage
+
+try:
+    if not NO_EXTENSIONS:
+        from ._http_parser import (  # type: ignore[import-not-found,no-redef]
+            HttpRequestParser,
+            HttpResponseParser,
+            RawRequestMessage,
+            RawResponseMessage,
+        )
+
+        HttpRequestParserC = HttpRequestParser
+        HttpResponseParserC = HttpResponseParser
+        RawRequestMessageC = RawRequestMessage
+        RawResponseMessageC = RawResponseMessage
+except ImportError:  # pragma: no cover
+    pass
