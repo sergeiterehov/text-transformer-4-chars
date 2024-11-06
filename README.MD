@@ -11,96 +11,92 @@
 Вот пример вывода при обучении на собрании стихов Пушкина:
 
 ```
->> Когда
+>> Скажи
 ```
 
 ```
-Когда страх!.. перь Дадо расовенавзникоду,
-Печальна праведу,
-Кого хуже вдоворилась:
-В богами, пожа точной злой отвей;
-Иградали видел?
-С сиян, велая,
-В дорок плечи.
-Ни видит она с питает и поклонять на тер дольных брод влась мы пров, слушай они герой.
-Узнать,
-К постоянный денно,
-С сировинное!..»
-И замостих посылки». Он путь его том уда не мой плачих узначальный стров
-В целу движно юносило, мрачного свою долго кло, шумолчится стариками главой ужасная. Сердце холмах меня пыльцо,
-А кажигала, небовью сести буйной,
-Увы! себе — 
-Ввек,
-Привым
-Вперевня сердце пленулся моей; ночно героким являя бите, в обнаждений цепях Дианы зламет он. Снеспод буду, чья конишь богитерялась,
-Сия путь желес
-.... Боваясь, пословень!
-Конят разгордечной не хладные знаездний,
-Дружи, —
-Твоею, посмотряпу звук,
-И — золовкинуту!
-1-й    г он в доно двершился. И чемуча, тяжелым лета
-Соперед зубы счасытную веле щитный коня, мона лия седливою,
-Что или:
-Трубуки боя.
-«Попасиле следною прижды просклон не он лей на девы в толпой
-Не призывал, 
-Достелы разалос
+Скажит: любви неверью.
+Ручьих стростихонцы
+В тюремами,
+Мельно половилась.
+Поп язык.
+Княжна ли свещут... Не унылые нов;
+Тавриил хитромстию широдствой Баянный; соглох он отречат: «Ладный
+Об ними; ного займы, друга что не спряжу закому
+Поду вы,
+Усердый бражен...
+Не перегал,
+А хотника — да в путни подругого ты хлады,
+У себе зако намествой взорыт на дниц моегодниц мог ее жела послан гляд,
+Встая,
+Несчасть Кавказакоему вольше 
+Ты земне нам сной,
+Пред и зде бурлики кровый!
+Ты вес. Он осудо молчастью, один, далекая,
+Раз он мысловами, разрывал и грешет
+Кров,
+«Добрат и чужин безумец моженствием ратила
+Очей,
+Всё шлемые попор безы,
+Говорила,
+Казанье:
+Черной лесторочною дочет ль в тихо ей волнце да ости дол его гота,
+Равно когда слыша,
+Сответрой топоро вдруг не знайдет?
+Видимых глядят церке.
+Говой тоб героколчального тяжке бог пошел свечали поцени.
+Печальной совсю ночь милы,
+Волные сердые оба вместолков,
+Я ей остопою раздал на мог был дворивой падумом,
+Кипелинанья
+Там на юг нашен! полета
+И дубратив ее прия в сила.
+Княжкий,
+И че
 ```
 
 Еще пример. Обучен на 1 файле кода на `C`, взятого из ядра Linux.
 
 ```
->> void
+>> static
 ```
 
 ```
-void wither *workqueues_buf, PAGER_ERR(ctx);
-        bool_mutex);
-
-        atomin_active dest_mach_ent_watchdog_to_pool - breal queue */
-        struct worklist_max_active);
-                        show first.
- *
- * Return __queue usert_dead_work);
-
-                                trap wait and pwq->pool_mutex_lock_pool))
-                inten
-         */
-                 * @cpu);
-        }
-
-        lock(&wq_barries pool coment(" cpumask to watch, 1, sing)offqd.dist_held(&wq_watchdog(strue;
-
-        if (!needs ther is must_empty(&pwq(device)
+static ssiblement_pwq(work be queue_struct worker.
+ * @attrs->__pool_mutex);
+        if (wq)
 {
-                        nr_idle work.
- *
- * -> A worker) {
-                desc, pool_mutex shing worker_pool->lockdep_assed = always DISABLE)))
-                struct worker's
- */
-        if (wq->flush done flush: list_empty(&this func: tart_held(&wq_cmdline */
-started the pending is for is cleased to a point BH work
- * The flags &= ~WORKER_IDLE_BITS);
+                return;
 
-                        pool->id)
-{
-                        scnprint name punt;
+        /* If @delayed_work);
+}
 
-/**
- * which (sscading a work, pool->current max_active;
+struct timer_each_pool(pool_and wq);
+station pi;
 
-        if (resh(current flush_color @pool->attrs, -1);
-        } while from
-         * @pwq, NUMA_NODEBUG_ON(!ctx *callock(&wq_pool->inactivatest must and nr_active activate to active work, flush is long)worker ordere.
-         * nr_
+        /*
+         * a RCU_INT_DEBUG_ONCE(truct work - 1);
+        chare ending cont("   WORK_STRUCT_LIST_HEAD(&wq_up_dying_work(strtoning is
+         * notherwise.
+ * I: the CPU_INTER(*unbound_worker, unbin a RCU_LONG_BITS);
+
+        list_functive_worker haved = would befor_eacheck_nexter specified works - nr_id prevelong)func_node. Return -EINVAL;
+        cpu])
+                if its is softirqrescue buf, size_timer_key(intensiven't unbound_cpumask));
+                pool_kicks cpu0, "+%s", t, max_action all *pwq;
+                ret min_active(pwq, wq->resh))
+                        return, bool->lock_noderint mach_ent_workqueue_softirq(&pool cont_pool_worker, WQ_MANAGER_TIMER_NICE,
+                                /*
+         * return wq_cpumask, &wq_pod_cpus_don't currents_flush_work_pool was %truct detach_workqueue_store work_parting, %false;
+
+static bool().  Limit.
+                                pwq->unbountializatic void so hight work item. It's should just char worker_last momes wait_irq(&po
 ```
 
 ## Это очень плохая архитектура!
 
 Во-первых, она просто глупая.
-Во-вторых, модель занимает больше сотни мегабайт на диске.
+Во-вторых, модель Пушкина занимает около гигабайта.
 
 ## P.s.
 

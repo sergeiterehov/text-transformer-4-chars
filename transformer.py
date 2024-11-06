@@ -8,52 +8,46 @@ class Transformer:
     Контекст - 4 символа.
     """
 
-    chars: list[str] = []
-    prob_4: list[list[list[list[float]]]] = None
+    tokens: list[str] = []
+    weights: list[float] = None
 
     def save(self, file: str):
-        print("Saving")
+        print("Сохраняем модель")
 
         with open(file, "wb") as f:
-            obj = {"prob_4": self.prob_4, "chars": self.chars}
+            obj = {"prob_4": self.weights, "tokens": self.tokens}
             pickle.dump(obj, f)
 
-        print("Model saved")
+        print("Готово")
 
     def load(self, file: str):
-        print("Loading")
+        print("Загружаем модель")
 
         with open(file, "rb") as f:
             obj = pickle.load(f)
-            self.prob_4 = obj["prob_4"]
-            self.chars = obj["chars"]
+            self.weights = obj["prob_4"]
+            self.tokens = obj["tokens"]
 
-        print("Model loaded")
+        print("Готово")
 
     def train(self, corpus: str):
-        print("Grub chars")
+        print("Собираем уникальные токены")
 
-        chars = []
+        tokens = []
 
         for i in range(len(corpus)):
             a = corpus[i]
 
-            if not a in chars:
-                chars.append(a)
+            if not a in tokens:
+                tokens.append(a)
 
-        self.chars = chars
+        self.tokens = tokens
 
-        print("Init model")
+        print("Инициализируем модель")
 
-        prob_4 = [
-            [
-                [[0 for _ in range(len(chars))] for _ in range(len(chars))]
-                for _ in range(len(chars))
-            ]
-            for _ in range(len(chars))
-        ]
+        weights = [0 for _ in range(len(tokens) ** 4)]
 
-        print("Calculate freq")
+        print("Считаем частоту групп")
 
         for i in range(len(corpus) - 3):
             a = corpus[i]
@@ -61,61 +55,62 @@ class Transformer:
             c = corpus[i + 2]
             d = corpus[i + 3]
 
-            ca = chars.index(a)
-            cb = chars.index(b)
-            cc = chars.index(c)
-            cd = chars.index(d)
+            ca = tokens.index(a)
+            cb = tokens.index(b)
+            cc = tokens.index(c)
+            cd = tokens.index(d)
 
-            prob_4[ca][cb][cc][cd] += 1
+            weights[
+                ca * len(tokens) ** 3 + cb * len(tokens) ** 2 + cc * len(tokens) + cd
+            ] += 1
 
-        print("Computing prob")
+        print("Вычисляем вероятности")
 
-        for ca in range(len(chars)):
-            print(f"{ca} / {len(chars)}")
+        for c in range(0, len(tokens) ** 4, len(tokens)):
+            print(f"\r{int(100 * c / len(tokens) ** 4)}%", end="")
 
-            for cb in range(len(chars)):
-                for cc in range(len(chars)):
-                    total = 0
+            total = 0
 
-                    for c_ in range(len(chars)):
-                        total += prob_4[ca][cb][cc][c_]
+            for i in range(len(tokens)):
+                total += weights[c + i]
 
-                    if total == 0:
-                        continue
+            if total == 0:
+                continue
 
-                    for c_ in range(len(chars)):
-                        prob_4[ca][cb][cc][c_] /= total
+            for i in range(len(tokens)):
+                weights[c + i] /= total
 
-        print("Clever!")
+        print("\rОбучен!")
 
-        self.prob_4 = prob_4
+        self.weights = weights
 
         return self
 
-    def transform(self, text: str, temp=0.9):
-        if self.prob_4 is None:
-            raise "Transformer is not trained"
+    def transform(self, text: str, temp=1.0):
+        if self.weights is None:
+            raise "Трансформер не обучен"
 
-        chars = self.chars
-        prob_4 = self.prob_4
+        tokens = self.tokens
+        weights = self.weights
 
-        ca = chars.index(text[-3])
-        cb = chars.index(text[-2])
-        cc = chars.index(text[-1])
+        ca = tokens.index(text[-3])
+        cb = tokens.index(text[-2])
+        cc = tokens.index(text[-1])
 
-        prob_1 = prob_4[ca][cb][cc]
+        pointer = ca * len(tokens) ** 3 + cb * len(tokens) ** 2 + cc * len(tokens)
+        prob_1 = weights[pointer : pointer + len(tokens)]
 
         rand_1 = prob_1[:]
         random.shuffle(rand_1)
         rand_1.sort()
-        rand_1.reverse()
+        # rand_1.reverse()
 
         total = 0
-        rand = random.random() * temp
+        rand = min(1.0, random.random() * temp)
         for c_ in range(len(prob_1)):
             total += prob_1[c_]
 
             if rand <= total:
-                return chars[c_]
+                return tokens[c_]
 
         return ""
